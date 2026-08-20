@@ -64,8 +64,9 @@ private final class PiPRootView: NSView {
 
 /// 提示条内容视图（自绘背景 + 文字），由 `PiPWindowController` 放进一个跟随浮窗的子窗口里。
 ///
-/// 为什么不用系统 tooltip：浮窗 level 为 `.screenSaver`(1000)，而系统 tooltip 是层级更低的独立窗口，
-/// 会被压在浮窗后面只露出窗外的一小截；它的初始延迟也由 `NSToolTipManager` 私有控制，无法调整。
+/// 为什么不用系统 tooltip：浮窗层级（全局悬浮档 `WindowLevelMode.globalLevel` = 100）高于系统 tooltip
+/// 所在的普通窗口层级，tooltip 会被压在浮窗后面只露出窗外的一小截；
+/// 它的初始延迟也由 `NSToolTipManager` 私有控制，无法调整。
 ///
 /// 为什么不用 `NSTextField`：`NSTextField` 的 cell 自身还有约 2pt 的左右内边距，
 /// 按 `NSString.size(withAttributes:)` 算出的宽度总会比 cell 实际需要的少 4pt 左右，
@@ -282,7 +283,7 @@ final class PiPWindowController: NSObject, NSWindowDelegate, NSMenuDelegate {
         self.levelMode = levelMode
 
         let frame = Self.initialFrame(aspect: safeAspect, width: initialWidth,
-                                     origin: origin, cascadeIndex: cascadeIndex)
+                                      origin: origin, cascadeIndex: cascadeIndex)
         panel = PiPPanel(
             contentRect: frame,
             styleMask: [.nonactivatingPanel, .borderless, .resizable, .fullSizeContentView],
@@ -401,11 +402,26 @@ final class PiPWindowController: NSObject, NSWindowDelegate, NSMenuDelegate {
             self?.delegate?.pipRequestToggleIdleDetection()
         }
         contentView.onRequestTogglePause = { [weak self] in self?.delegate?.pipRequestTogglePause() }
+        contentView.onRendererRecoveryExhausted = { [weak self] in
+            self?.delegate?.pipRendererRecoveryExhausted()
+        }
+        contentView.onRendererIncidentRecovered = { [weak self] id in
+            self?.delegate?.pipRendererDidRecover()
+            self?.showHint(
+                L.t("画面已自动恢复（日志编号 \(id)）",
+                    "Picture recovered automatically (log ID \(id))"),
+                near: nil,
+                duration: 4.0
+            )
+        }
         // 干净的单击（无修饰键、未拖动）→ 请求切回源应用
         contentView.onRequestActivateSource = { [weak self] in
             self?.delegate?.pipRequestActivateSource()
         }
-        // 手动拖动结束：位置持久化 + 跨屏后按新 scale 重新出流（系统拖动时这两件事由 windowDidMove 做）
+        contentView.onResolveDraggedWindowFrame = { [weak self] proposed, flags in
+            self?.delegate?.pipResolveDragFrame(proposed, modifierFlags: flags) ?? proposed
+        }
+        // 手动拖动结束：位置持久化 + 再确认一次跨屏 scale
         contentView.onDidDragWindow = { [weak self] in
             guard let self else { return }
             self.delegate?.pipDidMove()
@@ -644,6 +660,24 @@ final class PiPWindowController: NSObject, NSWindowDelegate, NSMenuDelegate {
         contentView.enqueue(sampleBuffer)
     }
 
+    /// 捕获流即将 resume / restart：清掉旧 renderer 队列，避免新旧 PTS/格式混用。
+    func prepareForCaptureDiscontinuity(_ reason: String) {
+        contentView.prepareForCaptureDiscontinuity(reason)
+    }
+
+    /// 把捕获 / 会话层事件写入 renderer 的内存环形缓冲；仅故障时随快照落盘。
+    func recordRendererEvent(_ event: String) {
+        contentView.recordDiagnosticEvent(event)
+    }
+
+    /// 仅用于 `--smoke-renderer`
+    var debugEnqueuedFrameCount: UInt64 { contentView.debugEnqueuedFrameCount }
+    var debugNotReadyDropCount: UInt64 { contentView.debugNotReadyDropCount }
+
+    /// 仅用于 `--smoke-level`
+    var debugWindowLevel: Int { panel.level.rawValue }
+    var debugHintWindowLevel: Int { hintWindow.level.rawValue }
+
     // MARK: - 状态同步
 
     func update(state: PiPSessionState) {
@@ -680,6 +714,7 @@ final class PiPWindowController: NSObject, NSWindowDelegate, NSMenuDelegate {
     func setTitle(_ title: String) {
         titleText = title
         panel.title = title
+        contentView.setDiagnosticLabel(title)
         overlay.titleText = title
         titleItem.title = title
     }

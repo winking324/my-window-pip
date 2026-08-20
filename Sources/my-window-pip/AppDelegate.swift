@@ -63,6 +63,114 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--smoke-update") { runUpdateRegression() }
         if CommandLine.arguments.contains("--smoke-activate") { runActivateRegression() }
         if CommandLine.arguments.contains("--smoke-mc") { runMissionControlRegression() }
+        if CommandLine.arguments.contains("--smoke-renderer") { runRendererRegression() }
+        if CommandLine.arguments.contains("--smoke-level") { runWindowLevelRegression() }
+    }
+
+    /// `--smoke-level`：浮窗层级回归自检。
+    /// 建一路 PiP → 断言「全局悬浮」档落在 `statusBar`(25) 之上、`popUpMenu`(101) 之下——
+    /// 这条边界就是「浮窗不挡菜单栏工具下拉菜单」的依据 → 切「普通置顶」断言 `.floating`(3)
+    /// → 切回断言恢复。每档都要求提示条子窗口与浮窗同层，否则提示条会被浮窗自己压住。
+    private func runWindowLevelRegression() {
+        Log.info("[level] 开始浮窗层级回归自检")
+        let popUpMenu = NSWindow.Level.popUpMenu.rawValue
+        let statusBar = NSWindow.Level.statusBar.rawValue
+        let expectedGlobal = WindowLevelMode.globalLevel.rawValue
+        var failed = false
+
+        func expect(_ what: String, _ actual: Int, _ expected: Int) {
+            let ok = actual == expected
+            if !ok { failed = true }
+            Log.info("[level] \(what)=\(actual)（期望 \(expected)）\(ok ? "通过" : "失败")")
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            SessionStore.shared.pipFrontmostWindow()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard let session = SessionStore.shared.sessions.first else {
+                Log.error("[level] 没能建立会话")
+                NSApp.terminate(nil)
+                return
+            }
+            let inRange = expectedGlobal > statusBar && expectedGlobal < popUpMenu
+            if !inRange { failed = true }
+            Log.info("""
+                [level] 全局悬浮层级 \(expectedGlobal) 落在 statusBar(\(statusBar)) 与 \
+                popUpMenu(\(popUpMenu)) 之间 \(inRange ? "通过" : "失败")
+                """)
+
+            session.setLevelMode(.global)
+            expect("全局悬浮 浮窗", session.debugWindowLevel, expectedGlobal)
+            expect("全局悬浮 提示条", session.debugHintWindowLevel, expectedGlobal)
+
+            session.setLevelMode(.normal)
+            expect("普通置顶 浮窗", session.debugWindowLevel, NSWindow.Level.floating.rawValue)
+            expect("普通置顶 提示条", session.debugHintWindowLevel, NSWindow.Level.floating.rawValue)
+
+            session.setLevelMode(.global)
+            expect("切回全局悬浮 浮窗", session.debugWindowLevel, expectedGlobal)
+
+            SessionStore.shared.closeAll()
+            Log.info("[level] 结束，\(failed ? "有断言失败" : "全部通过")")
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// `--smoke-renderer`：renderer 卡流检测与分级自愈回归。
+    ///
+    /// 两段：先用纯状态机断言时间边界（等价于单元测试，但不依赖只随完整 Xcode 提供的 XCTest），
+    /// 再在真实会话上触发一次计划性 flush，断言 flush 之后帧仍能继续入队——历史上「重置时间线」
+    /// 写错的典型后果就是 flush 完再也不接收新帧。
+    private func runRendererRegression() {
+        Log.info("[renderer] 开始卡流自愈回归自检")
+
+        var monitor = RendererStallMonitor(timeout: 2)
+        var stateMachineOK = monitor.observeNotReady(at: 0) == .none
+        stateMachineOK = stateMachineOK && monitor.observeNotReady(at: 1.99) == .none
+        stateMachineOK = stateMachineOK && monitor.observeNotReady(at: 2) == .flush
+        stateMachineOK = stateMachineOK && monitor.observeNotReady(at: 4) == .rebuildLayer
+        stateMachineOK = stateMachineOK && monitor.observeNotReady(at: 6) == .restartCapture
+        stateMachineOK = stateMachineOK && monitor.observeNotReady(at: 20) == .none
+        let recovered = monitor.observeReady(at: 21)
+        stateMachineOK = stateMachineOK && recovered != nil && !monitor.isTrackingStall
+        var lowerBound = RendererStallMonitor(timeout: 0)
+        stateMachineOK = stateMachineOK && lowerBound.timeout == 0.25
+        stateMachineOK = stateMachineOK && lowerBound.requestImmediateFlush(at: 1) == .flush
+        Log.info("""
+            [renderer] 状态机时间边界 \(stateMachineOK ? "通过" : "失败") \
+            （期望 none→flush→rebuildLayer→restartCapture，ready 后复位）
+            """)
+
+        var session: PiPSession?
+        var beforeFlush: UInt64 = 0
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            SessionStore.shared.pipFrontmostWindow()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            session = SessionStore.shared.sessions.first
+            guard let session else {
+                Log.error("[renderer] 没能建立会话")
+                NSApp.terminate(nil)
+                return
+            }
+            beforeFlush = session.debugEnqueuedFrameCount
+            Log.info("[renderer] flush 前入队 \(beforeFlush) 帧，触发一次计划性时间线重置")
+            session.debugForceDiscontinuity("smoke")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
+            guard let session else { return }
+            let after = session.debugEnqueuedFrameCount
+            let ok = after > beforeFlush
+            Log.info("""
+                [renderer] flush 后入队 \(after) 帧（新增 \(after - beforeFlush)，\
+                丢帧累计 \(session.debugNotReadyDropCount)）\(ok ? "继续接收（期望）" : "flush 后不再接帧（回归失败）")
+                """)
+            SessionStore.shared.closeAll()
+            Log.info("[renderer] 结束，剩余会话 \(SessionStore.shared.sessions.count)")
+            NSApp.terminate(nil)
+        }
     }
 
     /// `--smoke-mc`：调度中心回归自检。

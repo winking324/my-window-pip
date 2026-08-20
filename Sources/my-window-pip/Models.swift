@@ -11,7 +11,7 @@ enum CaptureSource: Equatable {
     /// 屏幕区域。`rect` 为 AppKit 全局坐标（左下原点，逻辑点）。
     case region(displayID: CGDirectDisplayID, rect: CGRect)
 
-    /// per-app 偏好（帧率/宽度/位置）使用的存储键。
+    /// per-app 偏好（帧率/宽度，以及位置的应用级回退）使用的存储键。
     var preferenceKey: String {
         switch self {
         case let .window(_, bundleID, appName, _): return bundleID ?? "app:\(appName)"
@@ -47,6 +47,66 @@ enum CaptureSource: Equatable {
     }
 }
 
+// MARK: - 位置记忆身份
+
+/// 一个 PiP 捕获目标的位置记忆身份。
+///
+/// 标题不稳定，不能参与身份。整窗使用 `CGWindowID`；区域捕获额外包含量化后的捕获矩形，
+/// 从而让同一源窗口里的多个裁剪区域、以及多个显示器区域分别记住自己的位置。
+enum PositionMemoryIdentity: Equatable {
+    case window(appPreferenceKey: String, windowID: CGWindowID)
+    case windowRegion(appPreferenceKey: String, windowID: CGWindowID, rect: CGRect)
+    case displayRegion(displayID: CGDirectDisplayID, rect: CGRect)
+
+    /// 沿用首版窗口级位置键前缀，避免开发版本之间丢失已经记住的整窗位置。
+    static let specificPreferencePrefix = "__window_position__:"
+
+    var preferenceKey: String {
+        switch self {
+        case let .window(appKey, windowID):
+            return "\(Self.specificPreferencePrefix)\(appKey):\(windowID)"
+        case let .windowRegion(appKey, windowID, rect):
+            return "\(Self.specificPreferencePrefix)region:\(appKey):\(windowID):\(Self.rectKey(rect))"
+        case let .displayRegion(displayID, rect):
+            return "\(Self.specificPreferencePrefix)display:\(displayID):\(Self.rectKey(rect))"
+        }
+    }
+
+    /// 没有精确记录时使用的旧版兼容回退，也是判断是否已有同类活跃会话的命名空间。
+    var fallbackPreferenceKey: String {
+        switch self {
+        case let .window(appKey, _), let .windowRegion(appKey, _, _): return appKey
+        case .displayRegion: return CaptureSource.regionPreferenceKey
+        }
+    }
+
+    /// 源应用重启并匹配到新窗口后，只替换窗口实例身份；区域几何保持不变。
+    func retargetingWindow(to source: CaptureSource) -> PositionMemoryIdentity {
+        guard case let .window(windowID, _, _, _) = source else { return self }
+        switch self {
+        case .window:
+            return .window(appPreferenceKey: source.preferenceKey, windowID: windowID)
+        case let .windowRegion(_, _, rect):
+            return .windowRegion(
+                appPreferenceKey: source.preferenceKey, windowID: windowID, rect: rect
+            )
+        case .displayRegion:
+            return self
+        }
+    }
+
+    static func isSpecificPreferenceKey(_ key: String) -> Bool {
+        key.hasPrefix(specificPreferencePrefix)
+    }
+
+    /// 选区最终会 integral，但窗口坐标仍可能带小数；量化到 1/16pt 可消除无意义的浮点抖动。
+    private static func rectKey(_ rect: CGRect) -> String {
+        [rect.minX, rect.minY, rect.width, rect.height]
+            .map { String(Int(($0 * 16).rounded())) }
+            .joined(separator: ",")
+    }
+}
+
 // MARK: - 会话状态
 
 /// 帧率档位。
@@ -74,9 +134,14 @@ enum WindowLevelMode: String, CaseIterable {
     /// 普通置顶：仅当前 Space，不侵入全屏应用。
     case normal
 
+    /// 比 `.popUpMenu`(101) 低一级：仍压在普通窗口(0)、浮动面板(3)、别的 App 的模态面板(8)、
+    /// 菜单栏本体(25) 之上，但让开状态栏工具的下拉菜单——浮窗放右上角时不再挡住那些菜单。
+    /// 不用 `.screenSaver`(1000) 就是因为它高于 101。
+    static let globalLevel = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
+
     var windowLevel: NSWindow.Level {
         switch self {
-        case .global: return .screenSaver
+        case .global: return Self.globalLevel
         case .normal: return .floating
         }
     }
@@ -117,6 +182,7 @@ struct PiPSessionState {
 /// 创建一个 PiP 会话的请求。
 struct SessionRequest {
     var source: CaptureSource
+    var positionIdentity: PositionMemoryIdentity
     /// 捕获基准矩形（源坐标系、左上原点、逻辑点）：
     /// - 整窗 PiP：`(0, 0, 窗口宽, 窗口高)`
     /// - 窗口内的区域捕获：该区域在窗口内的局部矩形
@@ -167,6 +233,8 @@ enum SessionRuntimeState: Equatable {
 protocol CaptureEngineDelegate: AnyObject {
     /// 在捕获队列（**非主线程**）调用，已通过帧闸门过滤，只会收到 `.complete` 帧。
     func captureDidOutput(_ sampleBuffer: CMSampleBuffer)
+    /// 主线程调用：引擎即将重建 SCStream；展示层应先重置旧 renderer 时间线。
+    func captureWillRestart()
     /// 主线程调用：流已停止（error 为 nil 表示主动停止）。
     func captureDidStop(error: Error?)
     /// 主线程调用：一段时间内未收到有效帧（源可能被最小化或遮挡）。
@@ -196,7 +264,14 @@ protocol PiPWindowDelegate: AnyObject {
     func pipRequestActivateSource()
     /// 切换「单击浮窗切换到源应用」开关
     func pipRequestToggleClickToActivate()
+    /// 显示层经 flush + 重建后仍无法接收帧，请求会话层重启捕获流。
+    func pipRendererRecoveryExhausted()
+    /// renderer 卡流已恢复：会话层据此清零重启限流计数。
+    func pipRendererDidRecover()
     /// 右键菜单将要更新：会话可趁此按需刷新源窗口标题
     func pipMenuWillOpen()
+    /// 拖动窗口时请求上层根据屏幕与其他 PiP 修正位置（尺寸由窗口层保持不变）
+    func pipResolveDragFrame(_ proposedFrame: CGRect,
+                             modifierFlags: NSEvent.ModifierFlags) -> CGRect
     func pipDidMove()
 }
