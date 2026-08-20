@@ -155,9 +155,9 @@ final class PlaceholderView: NSView {
             return Content(
                 symbols: ["arrow.down.right.and.arrow.up.left.circle",
                           "arrow.down.right.and.arrow.up.left"],
-                title: L.t("源窗口已最小化", "Source window minimized"),
-                subtitle: L.t("恢复「\(source.displayTitle)」后会自动继续",
-                              "Restore \(source.displayTitle) to resume automatically")
+                title: L.t("源窗口暂不可用", "Source window temporarily unavailable"),
+                subtitle: L.t("切回源窗口或取消最小化后会自动继续",
+                              "Bring the source window forward or restore it to resume automatically")
             )
 
         case let .reconnecting(attempt):
