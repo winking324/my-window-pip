@@ -61,6 +61,13 @@ enum PositionMemoryIdentity: Equatable {
     /// 沿用首版窗口级位置键前缀，避免开发版本之间丢失已经记住的整窗位置。
     static let specificPreferencePrefix = "__window_position__:"
 
+    /// 只有整窗捕获才应该跟随 ScreenCaptureKit 每帧上报的内容宽高比。
+    /// 窗口内区域即使刚好从 `(0, 0)` 开始，也不能被误判成整窗。
+    var capturesWholeWindow: Bool {
+        if case .window = self { return true }
+        return false
+    }
+
     var preferenceKey: String {
         switch self {
         case let .window(appKey, windowID):

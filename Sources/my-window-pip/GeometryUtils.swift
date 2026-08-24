@@ -1,5 +1,71 @@
 import AppKit
 
+/// 对 ScreenCaptureKit 帧中的真实内容宽高比做稳定化。
+///
+/// `SCStreamConfiguration.scalesToFit` 会在源内容与输出缓冲区宽高比不一致时补黑边。
+/// Electron 等应用的 `SCWindow.frame` 还可能与实际捕获表面短暂不一致，所以不能看到一帧变化
+/// 就立即调整窗口；连续多帧一致后才采纳，同时忽略像素取整造成的微小误差。
+struct CapturedContentAspectTracker {
+    static let requiredStableSamples = 3
+    static let correctionThreshold: CGFloat = 0.005
+    static let candidateTolerance: CGFloat = 0.002
+
+    private var candidateAspect: CGFloat?
+    private var candidateSamples = 0
+
+    /// 输入一帧的有效内容尺寸；确认需要校正时返回稳定后的新宽高比，否则返回 nil。
+    mutating func observe(contentSize: CGSize, expectedSize: CGSize) -> CGFloat? {
+        guard let observed = Self.aspect(of: contentSize),
+              let expected = Self.aspect(of: expectedSize) else {
+            resetCandidate()
+            return nil
+        }
+
+        if let candidateAspect,
+           Self.relativeDifference(candidateAspect, observed) <= Self.candidateTolerance {
+            let total = candidateAspect * CGFloat(candidateSamples) + observed
+            candidateSamples += 1
+            self.candidateAspect = total / CGFloat(candidateSamples)
+        } else {
+            candidateAspect = observed
+            candidateSamples = 1
+        }
+
+        guard candidateSamples >= Self.requiredStableSamples,
+              let stableAspect = candidateAspect else { return nil }
+        resetCandidate()
+
+        guard Self.relativeDifference(stableAspect, expected) > Self.correctionThreshold else {
+            return nil
+        }
+        return stableAspect
+    }
+
+    /// 保持源坐标宽度不变，只按真实内容宽高比修正高度。
+    static func correctedSize(_ size: CGSize, matching aspect: CGFloat) -> CGSize? {
+        guard size.width.isFinite, size.width > 1, aspect.isFinite, aspect > 0 else { return nil }
+        let height = size.width / aspect
+        guard height.isFinite, height > 1 else { return nil }
+        return CGSize(width: size.width, height: height)
+    }
+
+    static func relativeDifference(_ lhs: CGFloat, _ rhs: CGFloat) -> CGFloat {
+        guard lhs.isFinite, rhs.isFinite, lhs > 0, rhs > 0 else { return .infinity }
+        return abs(lhs - rhs) / max(lhs, rhs)
+    }
+
+    private static func aspect(of size: CGSize) -> CGFloat? {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return nil }
+        return size.width / size.height
+    }
+
+    private mutating func resetCandidate() {
+        candidateAspect = nil
+        candidateSamples = 0
+    }
+}
+
 /// 坐标与缩放几何工具。所有涉及坐标系转换的计算都必须走这里，避免各处各写一份。
 ///
 /// 坐标系约定：

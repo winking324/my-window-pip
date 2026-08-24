@@ -80,8 +80,13 @@ enum FrameGate {
     /// 用途：`scalesToFit` 下输出缓冲可能带黑边，或源窗口尺寸变化后输出还没跟上，
     /// 上层可据此判断「源尺寸变了」并重算输出分辨率 / 宽高比。解析不出返回 nil。
     static func contentRectPixelSize(_ sb: CMSampleBuffer) -> CGSize? {
-        guard let info = attachments(sb),
-              let dict = info[.contentRect] as? NSDictionary,
+        guard let info = attachments(sb) else { return nil }
+        return contentRectPixelSize(from: info)
+    }
+
+    /// 与 sample buffer 解包分离，便于对 SCK 附件的 CoreGraphics 字典格式做单元测试。
+    static func contentRectPixelSize(from info: [SCStreamFrameInfo: Any]) -> CGSize? {
+        guard let dict = info[.contentRect] as? NSDictionary,
               let rect = CGRect(dictionaryRepresentation: dict as CFDictionary) else { return nil }
         let scale = (info[.scaleFactor] as? CGFloat) ?? 1
         let factor = scale > 0 ? scale : 1
