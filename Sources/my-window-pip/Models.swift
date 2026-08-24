@@ -244,15 +244,38 @@ enum SessionRuntimeState: Equatable {
 // 说明：协议刻意不带 sender 参数，让捕获层与展示层互不依赖对方的具体类型，
 // 由会话层（PiPSession）同时实现两个协议做中转。
 
-/// 产出一帧时，捕获引擎已经确认生效的配置身份。
+/// 产出一帧时，捕获引擎对配置状态的确认结果。
 ///
-/// `sourceRect` 描述生成该帧的实际服务端裁剪，而不是会话层当前希望下发的值；配置异步更新
-/// 期间二者可能短暂不同。`generation` 用于隔离相邻配置的稳定性采样。
+/// 发起异步配置更新前先进入 `transitioning`：期间无法可靠判断帧由旧配置还是新配置生成，
+/// 因此只允许渲染、禁止几何采样。完成回调后才进入 `applied`，其中的 `sourceRect` 描述
+/// 已确认生效的服务端裁剪。`generation` 用于隔离相邻配置及其迟到回调。
 struct CaptureFrameConfiguration: Equatable {
-    let generation: UInt64
-    let sourceRect: CGRect
+    private enum Phase: Equatable {
+        case transitioning
+        case applied(sourceRect: CGRect)
+    }
 
-    var capturesFullSource: Bool { sourceRect.isEmpty }
+    let generation: UInt64
+    private let phase: Phase
+
+    static func transitioning(generation: UInt64) -> CaptureFrameConfiguration {
+        CaptureFrameConfiguration(generation: generation, phase: .transitioning)
+    }
+
+    static func applied(
+        generation: UInt64,
+        sourceRect: CGRect
+    ) -> CaptureFrameConfiguration {
+        CaptureFrameConfiguration(
+            generation: generation,
+            phase: .applied(sourceRect: sourceRect)
+        )
+    }
+
+    var capturesFullSource: Bool {
+        guard case let .applied(sourceRect) = phase else { return false }
+        return sourceRect.isEmpty
+    }
 }
 
 /// 捕获引擎向上回调。

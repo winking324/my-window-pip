@@ -5,7 +5,10 @@ import XCTest
 
 final class CapturedContentGeometryTests: XCTestCase {
 
-    private let fullConfiguration = CaptureFrameConfiguration(generation: 1, sourceRect: .zero)
+    private let fullConfiguration = CaptureFrameConfiguration.applied(
+        generation: 1,
+        sourceRect: .zero
+    )
 
     func testFrameGeometryRestoresOriginalSourcePointSize() {
         let info: [SCStreamFrameInfo: Any] = [
@@ -75,11 +78,11 @@ final class CapturedContentGeometryTests: XCTestCase {
 
     func testDelayedCroppedFramesCannotBecomeWholeWindowGeometryAfterZoomReset() {
         var tracker = CapturedContentGeometryTracker()
-        let cropped = CaptureFrameConfiguration(
+        let cropped = CaptureFrameConfiguration.applied(
             generation: 1,
             sourceRect: CGRect(x: 400, y: 200, width: 800, height: 400)
         )
-        let full = CaptureFrameConfiguration(generation: 2, sourceRect: .zero)
+        let full = CaptureFrameConfiguration.applied(generation: 2, sourceRect: .zero)
         let croppedSize = CGSize(width: 800, height: 400)
         let fullSize = CGSize(width: 1600, height: 800)
 
@@ -100,8 +103,8 @@ final class CapturedContentGeometryTests: XCTestCase {
     func testFullGeometryStabilityDoesNotCrossConfigurationGenerations() {
         var tracker = CapturedContentGeometryTracker()
         let source = CGSize(width: 1600, height: 800)
-        let first = CaptureFrameConfiguration(generation: 1, sourceRect: .zero)
-        let second = CaptureFrameConfiguration(generation: 2, sourceRect: .zero)
+        let first = CaptureFrameConfiguration.applied(generation: 1, sourceRect: .zero)
+        let second = CaptureFrameConfiguration.applied(generation: 2, sourceRect: .zero)
 
         XCTAssertNil(tracker.observe(sourceSize: source, at: 0.0, configuration: first))
         XCTAssertNil(tracker.observe(sourceSize: source, at: 0.2, configuration: first))
@@ -111,6 +114,18 @@ final class CapturedContentGeometryTests: XCTestCase {
             tracker.observe(sourceSize: source, at: 0.71, configuration: second),
             source
         )
+    }
+
+    func testTransitioningFramesCannotCommitCroppedGeometryAsFullSource() {
+        var tracker = CapturedContentGeometryTracker()
+        let transition = CaptureFrameConfiguration.transitioning(generation: 2)
+        let croppedSize = CGSize(width: 800, height: 400)
+
+        // 模拟 SCK 已开始输出新裁剪帧、但配置完成回调被主线程阻塞超过稳定窗口。
+        XCTAssertNil(tracker.observe(sourceSize: croppedSize, at: 0.0, configuration: transition))
+        XCTAssertNil(tracker.observe(sourceSize: croppedSize, at: 0.2, configuration: transition))
+        XCTAssertNil(tracker.observe(sourceSize: croppedSize, at: 0.4, configuration: transition))
+        XCTAssertFalse(transition.capturesFullSource)
     }
 
     func testFrameGeometryRemainsAuthoritativeAcrossRecovery() {

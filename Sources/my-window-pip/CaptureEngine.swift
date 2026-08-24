@@ -52,11 +52,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var nextFrameConfigurationGeneration: UInt64 = 0
     /// 帧回调队列：串行 + userInitiated，保证帧顺序且不与 UI 抢主线程
     private let frameQueue = DispatchQueue(label: CaptureEngine.queueLabel, qos: .userInitiated)
-    /// 只在 `frameQueue` 读写。成功配置更新通过同一队列发布，确保此前已排队的旧帧仍带旧身份。
-    private var appliedFrameConfiguration = CaptureFrameConfiguration(
-        generation: 0,
-        sourceRect: .zero
-    )
+    /// 只在 `frameQueue` 读写。配置过渡与确认都通过同一队列发布，保证帧身份顺序确定。
+    private var appliedFrameConfiguration = CaptureFrameConfiguration.transitioning(generation: 0)
 
     // MARK: - 卡流检测状态（跨线程，用锁保护）
 
@@ -265,7 +262,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// 兜底路径：完全重建流（`updateConfiguration/updateContentFilter` 不生效时用）。
     /// 反复调用安全：300ms 内的重复请求会被合并（filter/config 已是最新值，不会丢状态）。
-    func restart() {
+    func restart(force: Bool = false) {
         onMain { [weak self] in
             guard let self else { return }
             guard let filter = self.filter, let configuration = self.configuration else {
@@ -273,7 +270,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
                 return
             }
             let now = ProcessInfo.processInfo.systemUptime
-            if now - self.lastRestartUptime < Self.restartCoalesce {
+            if !force, now - self.lastRestartUptime < Self.restartCoalesce {
                 Log.debug("restart 合并：距上次重建不足 \(Self.restartCoalesce)s")
                 return
             }
@@ -293,20 +290,38 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private func applyConfiguration(_ configuration: SCStreamConfiguration) {
         guard let stream else { return }
         let frameConfiguration = makeFrameConfiguration(for: configuration)
+        let transition = CaptureFrameConfiguration.transitioning(
+            generation: frameConfiguration.generation
+        )
+        // 必须先在帧队列中进入过渡态，再向 SCK 发请求。否则新配置可能已开始产帧，
+        // 而完成回调仍滞留在主线程，导致这些帧沿用旧的整窗身份。
+        let previousFrameConfiguration = frameQueue.sync {
+            let previous = appliedFrameConfiguration
+            appliedFrameConfiguration = transition
+            return previous
+        }
         stream.updateConfiguration(configuration) { [weak self] error in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.stream === stream else { return }
                 if let error {
+                    // 连续更新可能让旧请求的错误回调晚到；只有失败代际仍是当前代际时才回滚。
+                    let shouldRestart = self.frameQueue.sync {
+                        guard self.appliedFrameConfiguration.generation
+                                == frameConfiguration.generation else { return false }
+                        self.appliedFrameConfiguration = previousFrameConfiguration
+                        return true
+                    }
+                    guard shouldRestart else { return }
                     Log.warn("updateConfiguration 失败：\(error.localizedDescription)，改为重建流")
-                    self.restart()
+                    // 失败后不能受普通重启合并窗口影响，否则过渡态可能长期残留。
+                    self.restart(force: true)
                     return
                 }
-                // 完成回调表示新配置已生效；在帧队列尾部发布身份。已经排队的帧保留旧身份，
-                // 发布后的帧才允许使用新 sourceRect，避免 UI 状态抢跑造成裁剪帧被当作整窗帧。
+                // 完成回调表示新配置已生效；此前排队的帧都保持过渡态，发布后的帧才允许
+                // 使用新 sourceRect。代际检查阻止旧完成回调覆盖更新的配置。
                 self.frameQueue.async { [weak self] in
-                    guard let self,
-                          frameConfiguration.generation
-                            > self.appliedFrameConfiguration.generation else { return }
+                    guard let self, self.appliedFrameConfiguration.generation
+                            == frameConfiguration.generation else { return }
                     self.appliedFrameConfiguration = frameConfiguration
                 }
             }
@@ -407,7 +422,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         for configuration: SCStreamConfiguration
     ) -> CaptureFrameConfiguration {
         nextFrameConfigurationGeneration &+= 1
-        return CaptureFrameConfiguration(
+        return CaptureFrameConfiguration.applied(
             generation: nextFrameConfigurationGeneration,
             sourceRect: configuration.sourceRect
         )
