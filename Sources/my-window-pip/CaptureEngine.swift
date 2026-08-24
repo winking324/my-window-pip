@@ -48,8 +48,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var retuneFlushScheduled = false
     private var lastRetuneUptime: TimeInterval = -.greatestFiniteMagnitude
     private var lastRestartUptime: TimeInterval = -.greatestFiniteMagnitude
+    /// 只在主线程递增；每次建流或成功请求异步配置更新时分配一个新代际。
+    private var nextFrameConfigurationGeneration: UInt64 = 0
     /// 帧回调队列：串行 + userInitiated，保证帧顺序且不与 UI 抢主线程
     private let frameQueue = DispatchQueue(label: CaptureEngine.queueLabel, qos: .userInitiated)
+    /// 只在 `frameQueue` 读写。成功配置更新通过同一队列发布，确保此前已排队的旧帧仍带旧身份。
+    private var appliedFrameConfiguration = CaptureFrameConfiguration(
+        generation: 0,
+        sourceRect: .zero
+    )
 
     // MARK: - 卡流检测状态（跨线程，用锁保护）
 
@@ -150,6 +157,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         self.filter = filter
         self.configuration = configuration
         currentFPS = Self.fps(of: configuration)
+        let frameConfiguration = makeFrameConfiguration(for: configuration)
+        // removeStreamOutput 后排空已经入队的旧回调，再切换身份；旧流迟到帧不会冒充新配置。
+        frameQueue.sync { appliedFrameConfiguration = frameConfiguration }
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
@@ -282,12 +292,23 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func applyConfiguration(_ configuration: SCStreamConfiguration) {
         guard let stream else { return }
+        let frameConfiguration = makeFrameConfiguration(for: configuration)
         stream.updateConfiguration(configuration) { [weak self] error in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.stream === stream else { return }
-                guard let error else { return }
-                Log.warn("updateConfiguration 失败：\(error.localizedDescription)，改为重建流")
-                self.restart()
+                if let error {
+                    Log.warn("updateConfiguration 失败：\(error.localizedDescription)，改为重建流")
+                    self.restart()
+                    return
+                }
+                // 完成回调表示新配置已生效；在帧队列尾部发布身份。已经排队的帧保留旧身份，
+                // 发布后的帧才允许使用新 sourceRect，避免 UI 状态抢跑造成裁剪帧被当作整窗帧。
+                self.frameQueue.async { [weak self] in
+                    guard let self,
+                          frameConfiguration.generation
+                            > self.appliedFrameConfiguration.generation else { return }
+                    self.appliedFrameConfiguration = frameConfiguration
+                }
             }
         }
     }
@@ -302,7 +323,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
               CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
         guard FrameGate.accept(sampleBuffer) else { return }
         noteFrameArrived()
-        delegate?.captureDidOutput(sampleBuffer)
+        delegate?.captureDidOutput(sampleBuffer, configuration: appliedFrameConfiguration)
     }
 
     // MARK: - SCStreamDelegate
@@ -379,5 +400,16 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func onMain(_ block: @escaping () -> Void) {
         if Thread.isMainThread { block() } else { DispatchQueue.main.async(execute: block) }
+    }
+
+    /// 主线程调用，为一次实际建流 / 配置更新生成不可复用的帧身份。
+    private func makeFrameConfiguration(
+        for configuration: SCStreamConfiguration
+    ) -> CaptureFrameConfiguration {
+        nextFrameConfigurationGeneration &+= 1
+        return CaptureFrameConfiguration(
+            generation: nextFrameConfigurationGeneration,
+            sourceRect: configuration.sourceRect
+        )
     }
 }

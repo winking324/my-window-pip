@@ -121,7 +121,10 @@ private final class FrameProbe: CaptureEngineDelegate {
 
     func captureWillRestart() {}
 
-    func captureDidOutput(_ sampleBuffer: CMSampleBuffer) {
+    func captureDidOutput(
+        _ sampleBuffer: CMSampleBuffer,
+        configuration _: CaptureFrameConfiguration
+    ) {
         lock.lock()
         frames += 1
         if let px = sampleBuffer.imageBuffer {

@@ -68,7 +68,10 @@ enum PositionMemoryIdentity: Equatable {
         return false
     }
 
-    /// 当前帧是否来自未裁剪的完整窗口；只有这种帧的内容几何能更新完整源坐标系。
+    /// 当前会话状态是否应请求未裁剪的完整窗口。
+    ///
+    /// 这只能用于构造下一份配置，不能据此判断已经到达的帧；帧身份必须读取
+    /// `CaptureFrameConfiguration`，因为 ScreenCaptureKit 的配置更新是异步的。
     func usesUncroppedWholeWindow(at zoom: CGFloat) -> Bool {
         capturesWholeWindow && zoom <= PiPSessionState.minZoom + 0.001
     }
@@ -241,10 +244,24 @@ enum SessionRuntimeState: Equatable {
 // 说明：协议刻意不带 sender 参数，让捕获层与展示层互不依赖对方的具体类型，
 // 由会话层（PiPSession）同时实现两个协议做中转。
 
+/// 产出一帧时，捕获引擎已经确认生效的配置身份。
+///
+/// `sourceRect` 描述生成该帧的实际服务端裁剪，而不是会话层当前希望下发的值；配置异步更新
+/// 期间二者可能短暂不同。`generation` 用于隔离相邻配置的稳定性采样。
+struct CaptureFrameConfiguration: Equatable {
+    let generation: UInt64
+    let sourceRect: CGRect
+
+    var capturesFullSource: Bool { sourceRect.isEmpty }
+}
+
 /// 捕获引擎向上回调。
 protocol CaptureEngineDelegate: AnyObject {
     /// 在捕获队列（**非主线程**）调用，已通过帧闸门过滤，只会收到 `.complete` 帧。
-    func captureDidOutput(_ sampleBuffer: CMSampleBuffer)
+    func captureDidOutput(
+        _ sampleBuffer: CMSampleBuffer,
+        configuration: CaptureFrameConfiguration
+    )
     /// 主线程调用：引擎即将重建 SCStream；展示层应先重置旧 renderer 时间线。
     func captureWillRestart()
     /// 主线程调用：流已停止（error 为 nil 表示主动停止）。

@@ -13,12 +13,23 @@ struct CapturedContentGeometryTracker {
     private var candidateSize: CGSize?
     private var candidateSamples = 0
     private var candidateStartedAt: TimeInterval?
+    private var candidateConfigurationGeneration: UInt64?
 
-    /// 输入一帧还原出的源窗口尺寸；达到稳定条件时返回平均尺寸，否则返回 nil。
-    mutating func observe(sourceSize: CGSize, at now: TimeInterval) -> CGSize? {
-        guard Self.isValid(sourceSize), now.isFinite else {
+    /// 输入一帧还原出的源窗口尺寸；只采纳实际由整窗配置生成的帧，并且不跨配置代际累计。
+    /// 达到稳定条件时返回平均尺寸，否则返回 nil。
+    mutating func observe(
+        sourceSize: CGSize,
+        at now: TimeInterval,
+        configuration: CaptureFrameConfiguration
+    ) -> CGSize? {
+        guard configuration.capturesFullSource,
+              Self.isValid(sourceSize), now.isFinite else {
             reset()
             return nil
+        }
+        if candidateConfigurationGeneration != configuration.generation {
+            reset()
+            candidateConfigurationGeneration = configuration.generation
         }
 
         if let candidateSize,
@@ -47,6 +58,7 @@ struct CapturedContentGeometryTracker {
         candidateSize = nil
         candidateSamples = 0
         candidateStartedAt = nil
+        candidateConfigurationGeneration = nil
     }
 
     static func relativeDifference(_ lhs: CGSize, _ rhs: CGSize) -> CGFloat {

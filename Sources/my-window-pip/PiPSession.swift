@@ -510,7 +510,10 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         windowController.prepareForCaptureDiscontinuity("捕获流即将重建")
     }
 
-    func captureDidOutput(_ sampleBuffer: CMSampleBuffer) {
+    func captureDidOutput(
+        _ sampleBuffer: CMSampleBuffer,
+        configuration: CaptureFrameConfiguration
+    ) {
         // 在捕获队列上先把轻量元数据复制出来；真正的几何/UI 更新仍统一切回主线程。
         let capturedContentGeometry = FrameGate.contentGeometry(sampleBuffer)
         if state.idleDetection,
@@ -526,7 +529,10 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
                 self.probeTimer = nil
             }
             if let capturedContentGeometry {
-                self.reconcileCapturedContentGeometry(capturedContentGeometry)
+                self.reconcileCapturedContentGeometry(
+                    capturedContentGeometry,
+                    configuration: configuration
+                )
             }
             self.windowController.enqueue(sampleBuffer)
         }
@@ -535,10 +541,13 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     /// 用完整帧附件还原出的真实源窗口尺寸校正整窗 PiP。
     ///
     /// SCK 会在 `scalesToFit` 输出中保留源宽高比；源窗口尺寸变化或 Electron 捕获表面与
-    /// `SCWindow.frame` 不一致时，剩余区域被填成黑色。这里只接受 zoom=1、sourceRect=.zero
-    /// 的完整窗口帧；放大后的帧只描述局部裁剪，绝不能拿来覆盖完整源坐标系。
-    private func reconcileCapturedContentGeometry(_ geometry: FrameContentGeometry) {
-        guard positionIdentity.usesUncroppedWholeWindow(at: state.zoom) else {
+    /// `SCWindow.frame` 不一致时，剩余区域被填成黑色。这里只接受实际由 `sourceRect=.zero`
+    /// 配置生成的完整窗口帧；不能依据异步更新前就已改变的 UI zoom 状态来推断帧身份。
+    private func reconcileCapturedContentGeometry(
+        _ geometry: FrameContentGeometry,
+        configuration: CaptureFrameConfiguration
+    ) {
+        guard positionIdentity.capturesWholeWindow else {
             capturedContentGeometryTracker.reset()
             return
         }
@@ -548,7 +557,9 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         }
         let now = ProcessInfo.processInfo.systemUptime
         guard let stableSourceSize = capturedContentGeometryTracker.observe(
-            sourceSize: observedSourceSize, at: now
+            sourceSize: observedSourceSize,
+            at: now,
+            configuration: configuration
         ) else { return }
 
         // 从这一刻起，帧几何是本窗口实例的权威来源；暂停/恢复期间保留，重匹配时才清空。
