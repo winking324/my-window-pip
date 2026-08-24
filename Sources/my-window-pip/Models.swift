@@ -61,6 +61,21 @@ enum PositionMemoryIdentity: Equatable {
     /// 沿用首版窗口级位置键前缀，避免开发版本之间丢失已经记住的整窗位置。
     static let specificPreferencePrefix = "__window_position__:"
 
+    /// 只有整窗捕获才应该跟随 ScreenCaptureKit 每帧上报的内容宽高比。
+    /// 窗口内区域即使刚好从 `(0, 0)` 开始，也不能被误判成整窗。
+    var capturesWholeWindow: Bool {
+        if case .window = self { return true }
+        return false
+    }
+
+    /// 当前会话状态是否应请求未裁剪的完整窗口。
+    ///
+    /// 这只能用于构造下一份配置，不能据此判断已经到达的帧；帧身份必须读取
+    /// `CaptureFrameConfiguration`，因为 ScreenCaptureKit 的配置更新是异步的。
+    func usesUncroppedWholeWindow(at zoom: CGFloat) -> Bool {
+        capturesWholeWindow && zoom <= PiPSessionState.minZoom + 0.001
+    }
+
     var preferenceKey: String {
         switch self {
         case let .window(appKey, windowID):
@@ -229,10 +244,47 @@ enum SessionRuntimeState: Equatable {
 // 说明：协议刻意不带 sender 参数，让捕获层与展示层互不依赖对方的具体类型，
 // 由会话层（PiPSession）同时实现两个协议做中转。
 
+/// 产出一帧时，捕获引擎对配置状态的确认结果。
+///
+/// 发起异步配置更新前先进入 `transitioning`：期间无法可靠判断帧由旧配置还是新配置生成，
+/// 因此只允许渲染、禁止几何采样。完成回调后才进入 `applied`，其中的 `sourceRect` 描述
+/// 已确认生效的服务端裁剪。`generation` 用于隔离相邻配置及其迟到回调。
+struct CaptureFrameConfiguration: Equatable {
+    private enum Phase: Equatable {
+        case transitioning
+        case applied(sourceRect: CGRect)
+    }
+
+    let generation: UInt64
+    private let phase: Phase
+
+    static func transitioning(generation: UInt64) -> CaptureFrameConfiguration {
+        CaptureFrameConfiguration(generation: generation, phase: .transitioning)
+    }
+
+    static func applied(
+        generation: UInt64,
+        sourceRect: CGRect
+    ) -> CaptureFrameConfiguration {
+        CaptureFrameConfiguration(
+            generation: generation,
+            phase: .applied(sourceRect: sourceRect)
+        )
+    }
+
+    var capturesFullSource: Bool {
+        guard case let .applied(sourceRect) = phase else { return false }
+        return sourceRect.isEmpty
+    }
+}
+
 /// 捕获引擎向上回调。
 protocol CaptureEngineDelegate: AnyObject {
     /// 在捕获队列（**非主线程**）调用，已通过帧闸门过滤，只会收到 `.complete` 帧。
-    func captureDidOutput(_ sampleBuffer: CMSampleBuffer)
+    func captureDidOutput(
+        _ sampleBuffer: CMSampleBuffer,
+        configuration: CaptureFrameConfiguration
+    )
     /// 主线程调用：引擎即将重建 SCStream；展示层应先重置旧 renderer 时间线。
     func captureWillRestart()
     /// 主线程调用：流已停止（error 为 nil 表示主动停止）。

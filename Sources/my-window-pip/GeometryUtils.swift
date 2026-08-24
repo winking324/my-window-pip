@@ -1,5 +1,100 @@
 import AppKit
 
+/// 对 ScreenCaptureKit 帧还原出的源窗口尺寸做稳定化。
+///
+/// `SCStreamConfiguration.scalesToFit` 会在源内容与输出缓冲区宽高比不一致时补黑边。
+/// Electron 等应用的 `SCWindow.frame` 还可能与实际捕获表面短暂不一致，所以不能看到一帧变化
+/// 就立即调整窗口；同时满足连续帧数和稳定时长后才采纳，并忽略像素取整造成的微小误差。
+struct CapturedContentGeometryTracker {
+    static let requiredStableSamples = 3
+    static let requiredStableDuration: TimeInterval = 0.3
+    static let candidateTolerance: CGFloat = 0.002
+
+    private var candidateSize: CGSize?
+    private var candidateSamples = 0
+    private var candidateStartedAt: TimeInterval?
+    private var candidateConfigurationGeneration: UInt64?
+
+    /// 输入一帧还原出的源窗口尺寸；只采纳实际由整窗配置生成的帧，并且不跨配置代际累计。
+    /// 达到稳定条件时返回平均尺寸，否则返回 nil。
+    mutating func observe(
+        sourceSize: CGSize,
+        at now: TimeInterval,
+        configuration: CaptureFrameConfiguration
+    ) -> CGSize? {
+        guard configuration.capturesFullSource,
+              Self.isValid(sourceSize), now.isFinite else {
+            reset()
+            return nil
+        }
+        if candidateConfigurationGeneration != configuration.generation {
+            reset()
+            candidateConfigurationGeneration = configuration.generation
+        }
+
+        if let candidateSize,
+           Self.relativeDifference(candidateSize, sourceSize) <= Self.candidateTolerance {
+            let count = CGFloat(candidateSamples)
+            candidateSamples += 1
+            self.candidateSize = CGSize(
+                width: (candidateSize.width * count + sourceSize.width) / CGFloat(candidateSamples),
+                height: (candidateSize.height * count + sourceSize.height) / CGFloat(candidateSamples)
+            )
+        } else {
+            candidateSize = sourceSize
+            candidateSamples = 1
+            candidateStartedAt = now
+        }
+
+        guard candidateSamples >= Self.requiredStableSamples,
+              let candidateStartedAt,
+              now - candidateStartedAt >= Self.requiredStableDuration,
+              let stableSize = candidateSize else { return nil }
+        reset()
+        return stableSize
+    }
+
+    mutating func reset() {
+        candidateSize = nil
+        candidateSamples = 0
+        candidateStartedAt = nil
+        candidateConfigurationGeneration = nil
+    }
+
+    static func relativeDifference(_ lhs: CGSize, _ rhs: CGSize) -> CGFloat {
+        guard isValid(lhs), isValid(rhs) else { return .infinity }
+        let dw = abs(lhs.width - rhs.width) / max(lhs.width, rhs.width)
+        let dh = abs(lhs.height - rhs.height) / max(lhs.height, rhs.height)
+        return max(dw, dh)
+    }
+
+    private static func isValid(_ size: CGSize) -> Bool {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return false }
+        return true
+    }
+}
+
+/// 同一捕获目标的源几何权威状态。
+///
+/// 建流前只能用 SCWindow / AX 尺寸作为猜测；一旦完整帧确认了原始内容尺寸，暂停、恢复和
+/// 延迟 recheck 都必须保留帧结果。只有目标窗口实例发生重匹配时才重新允许外部尺寸采样。
+struct SourceGeometryAuthority {
+    private(set) var frameConfirmedSize: CGSize?
+
+    var acceptsWindowServerSamples: Bool { frameConfirmedSize == nil }
+
+    mutating func confirmFrameSize(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return }
+        frameConfirmedSize = size
+    }
+
+    mutating func resetForNewTarget() {
+        frameConfirmedSize = nil
+    }
+}
+
 /// 坐标与缩放几何工具。所有涉及坐标系转换的计算都必须走这里，避免各处各写一份。
 ///
 /// 坐标系约定：

@@ -3,6 +3,31 @@ import CoreVideo
 import Foundation
 import ScreenCaptureKit
 
+/// ScreenCaptureKit 写入单帧附件的内容几何。
+///
+/// `contentRect` 位于输出 surface 的点坐标系；`contentScale` 是「原始内容点尺寸 → surface
+/// 点尺寸」的缩放系数，因此两者相除才能恢复可用于 sourceRect 的原始源坐标尺寸。
+struct FrameContentGeometry: Equatable {
+    let surfaceRect: CGRect
+    let scaleFactor: CGFloat
+    let contentScale: CGFloat?
+
+    var surfacePixelSize: CGSize {
+        CGSize(width: surfaceRect.width * scaleFactor, height: surfaceRect.height * scaleFactor)
+    }
+
+    var sourcePointSize: CGSize? {
+        guard let contentScale, contentScale.isFinite, contentScale > 0 else { return nil }
+        let size = CGSize(
+            width: surfaceRect.width / contentScale,
+            height: surfaceRect.height / contentScale
+        )
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return nil }
+        return size
+    }
+}
+
 /// 帧闸门：只做「这一帧要不要」与「这一帧长什么样」的廉价判断，无状态。
 ///
 /// 两个职责：
@@ -80,14 +105,35 @@ enum FrameGate {
     /// 用途：`scalesToFit` 下输出缓冲可能带黑边，或源窗口尺寸变化后输出还没跟上，
     /// 上层可据此判断「源尺寸变了」并重算输出分辨率 / 宽高比。解析不出返回 nil。
     static func contentRectPixelSize(_ sb: CMSampleBuffer) -> CGSize? {
-        guard let info = attachments(sb),
-              let dict = info[.contentRect] as? NSDictionary,
+        contentGeometry(sb)?.surfacePixelSize
+    }
+
+    /// 与 sample buffer 解包分离，便于对 SCK 附件的 CoreGraphics 字典格式做单元测试。
+    static func contentRectPixelSize(from info: [SCStreamFrameInfo: Any]) -> CGSize? {
+        contentGeometry(from: info)?.surfacePixelSize
+    }
+
+    static func contentGeometry(_ sb: CMSampleBuffer) -> FrameContentGeometry? {
+        guard let info = attachments(sb) else { return nil }
+        return contentGeometry(from: info)
+    }
+
+    static func contentGeometry(from info: [SCStreamFrameInfo: Any]) -> FrameContentGeometry? {
+        guard let dict = info[.contentRect] as? NSDictionary,
               let rect = CGRect(dictionaryRepresentation: dict as CFDictionary) else { return nil }
-        let scale = (info[.scaleFactor] as? CGFloat) ?? 1
-        let factor = scale > 0 ? scale : 1
-        let size = CGSize(width: rect.width * factor, height: rect.height * factor)
-        guard size.width > 0, size.height > 0 else { return nil }
-        return size
+        guard rect.minX.isFinite, rect.minY.isFinite,
+              rect.width.isFinite, rect.height.isFinite,
+              rect.width > 1, rect.height > 1 else { return nil }
+
+        let rawScaleFactor = (info[.scaleFactor] as? CGFloat) ?? 1
+        let scaleFactor = rawScaleFactor.isFinite && rawScaleFactor > 0 ? rawScaleFactor : 1
+        let rawContentScale = info[.contentScale] as? CGFloat
+        let contentScale = rawContentScale.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        return FrameContentGeometry(
+            surfaceRect: rect,
+            scaleFactor: scaleFactor,
+            contentScale: contentScale
+        )
     }
 
     /// 本帧的脏矩形数量。SCK 只在内容真的变化时才写入非空 `dirtyRects`，

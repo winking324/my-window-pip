@@ -46,6 +46,10 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     private var isClosed = false
     /// renderer 自愈触发的捕获流重启时刻，用于限流
     private var rendererRestartTimes: [TimeInterval] = []
+    /// SCK 帧还原出的源窗口尺寸连续稳定后才采纳，避免瞬态帧让浮窗来回跳。
+    private var capturedContentGeometryTracker = CapturedContentGeometryTracker()
+    /// 控制 SCWindow/AX 猜测与完整帧几何之间的权威切换。
+    private var sourceGeometryAuthority = SourceGeometryAuthority()
 
     private static let hiddenAutoCloseSeconds: TimeInterval = 60
     private static let maxReconnectAttempts = 3
@@ -336,9 +340,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         // 整窗 + 未放大时不下发裁剪框：`.zero` 让 SCK 直接给整个窗口内容。
         // 这样即使 baseRect 没能及时跟上窗口尺寸（例如调度中心期间采样到被总览变换的
         // 矩形），画面也只是宽高比暂时不准，不会被裁成窗口左上角局部。
-        if case .window = state.source,
-           state.zoom <= PiPSessionState.minZoom + 0.001,
-           abs(baseRect.minX) < 0.5, abs(baseRect.minY) < 0.5 {
+        if positionIdentity.usesUncroppedWholeWindow(at: state.zoom) {
             return .zero
         }
         return Geo.sourceRect(zoom: state.zoom, anchor: state.anchor, full: baseRect)
@@ -423,6 +425,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     private func startStream(filter: SCContentFilter) {
+        capturedContentGeometryTracker.reset()
         let configuration = makeConfiguration()
         windowController.recordRendererEvent("capture.start \(configurationSummary(configuration))")
         do {
@@ -446,9 +449,8 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     /// 矩形（且 `isOnScreen` 仍为 true），照抄会把裁剪框改小，退出总览后画面就永久停在
     /// 源窗口左上角局部。判定见 `Geo.trustedSourceSize`。
     private func syncBaseRectIfNeeded(with window: SCWindow) {
-        guard case .window = state.source else { return }
-        let isFullWindow = abs(baseRect.minX) < 0.5 && abs(baseRect.minY) < 0.5
-        guard isFullWindow else { return }   // 窗口内的区域捕获不跟随窗口尺寸变化
+        guard positionIdentity.capturesWholeWindow,
+              sourceGeometryAuthority.acceptsWindowServerSamples else { return }
         guard let size = trustedSize(of: window) else { return }
         guard abs(baseRect.width - size.width) > 1 || abs(baseRect.height - size.height) > 1 else { return }
         baseRect = CGRect(origin: .zero, size: size)
@@ -503,11 +505,17 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     // MARK: - CaptureEngineDelegate
 
     func captureWillRestart() {
+        capturedContentGeometryTracker.reset()
         windowController.recordRendererEvent("capture.restart.begin")
         windowController.prepareForCaptureDiscontinuity("捕获流即将重建")
     }
 
-    func captureDidOutput(_ sampleBuffer: CMSampleBuffer) {
+    func captureDidOutput(
+        _ sampleBuffer: CMSampleBuffer,
+        configuration: CaptureFrameConfiguration
+    ) {
+        // 在捕获队列上先把轻量元数据复制出来；真正的几何/UI 更新仍统一切回主线程。
+        let capturedContentGeometry = FrameGate.contentGeometry(sampleBuffer)
         if state.idleDetection,
            let verdict = idleDetector.feed(sampleBuffer, activeFPS: state.fps.rawValue) {
             DispatchQueue.main.async { [weak self] in self?.apply(verdict) }
@@ -520,8 +528,73 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
                 self.probeTimer?.invalidate()
                 self.probeTimer = nil
             }
+            if let capturedContentGeometry {
+                self.reconcileCapturedContentGeometry(
+                    capturedContentGeometry,
+                    configuration: configuration
+                )
+            }
             self.windowController.enqueue(sampleBuffer)
         }
+    }
+
+    /// 用完整帧附件还原出的真实源窗口尺寸校正整窗 PiP。
+    ///
+    /// SCK 会在 `scalesToFit` 输出中保留源宽高比；源窗口尺寸变化或 Electron 捕获表面与
+    /// `SCWindow.frame` 不一致时，剩余区域被填成黑色。这里只接受实际由 `sourceRect=.zero`
+    /// 配置生成的完整窗口帧；不能依据异步更新前就已改变的 UI zoom 状态来推断帧身份。
+    private func reconcileCapturedContentGeometry(
+        _ geometry: FrameContentGeometry,
+        configuration: CaptureFrameConfiguration
+    ) {
+        guard positionIdentity.capturesWholeWindow else {
+            capturedContentGeometryTracker.reset()
+            return
+        }
+        guard let observedSourceSize = geometry.sourcePointSize else {
+            capturedContentGeometryTracker.reset()
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let stableSourceSize = capturedContentGeometryTracker.observe(
+            sourceSize: observedSourceSize,
+            at: now,
+            configuration: configuration
+        ) else { return }
+
+        // 从这一刻起，帧几何是本窗口实例的权威来源；暂停/恢复期间保留，重匹配时才清空。
+        sourceGeometryAuthority.confirmFrameSize(stableSourceSize)
+        sourcePixelSize = CGSize(
+            width: stableSourceSize.width * geometry.scaleFactor,
+            height: stableSourceSize.height * geometry.scaleFactor
+        )
+
+        let before = baseRect.size
+        let sizeChanged = abs(before.width - stableSourceSize.width) > 1
+            || abs(before.height - stableSourceSize.height) > 1
+        guard sizeChanged else { return }
+
+        let oldAspect = before.width / max(1, before.height)
+        let newAspect = stableSourceSize.width / max(1, stableSourceSize.height)
+        let aspectDifference = abs(oldAspect - newAspect) / max(oldAspect, newAspect)
+        baseRect = CGRect(origin: .zero, size: stableSourceSize)
+        state.anchor = Geo.clampAnchor(state.anchor, zoom: state.zoom)
+
+        windowController.recordRendererEvent(
+            String(
+                format: "geometry.frame-source %.0fx%.0f->%.0fx%.0f aspect=%.4f->%.4f",
+                before.width, before.height,
+                stableSourceSize.width, stableSourceSize.height,
+                oldAspect, newAspect
+            )
+        )
+        Log.debug(
+            "捕获源尺寸校正：\(Int(before.width))×\(Int(before.height)) → "
+                + "\(Int(stableSourceSize.width))×\(Int(stableSourceSize.height))"
+        )
+        guard aspectDifference > 0.005 else { return }
+        windowController.setAspect(stableSourceSize)
+        retune(reason: "捕获源宽高比校正")
     }
 
     func captureDidStop(error: Error?) {
@@ -630,6 +703,8 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
             let rematchedSource = ShareableContentStore.shared.captureSource(for: window)
             self.state.source = rematchedSource
             self.positionIdentity = self.positionIdentity.retargetingWindow(to: rematchedSource)
+            self.sourceGeometryAuthority.resetForNewTarget()
+            self.capturedContentGeometryTracker.reset()
             // 重新匹配同样不能照抄可能被总览变换过的尺寸
             let size = self.trustedSize(of: window) ?? self.baseRect.size
             self.baseRect = CGRect(origin: .zero, size: size)
