@@ -68,6 +68,11 @@ enum PositionMemoryIdentity: Equatable {
         return false
     }
 
+    /// 当前帧是否来自未裁剪的完整窗口；只有这种帧的内容几何能更新完整源坐标系。
+    func usesUncroppedWholeWindow(at zoom: CGFloat) -> Bool {
+        capturesWholeWindow && zoom <= PiPSessionState.minZoom + 0.001
+    }
+
     var preferenceKey: String {
         switch self {
         case let .window(appKey, windowID):

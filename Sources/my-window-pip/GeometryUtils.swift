@@ -1,68 +1,85 @@
 import AppKit
 
-/// 对 ScreenCaptureKit 帧中的真实内容宽高比做稳定化。
+/// 对 ScreenCaptureKit 帧还原出的源窗口尺寸做稳定化。
 ///
 /// `SCStreamConfiguration.scalesToFit` 会在源内容与输出缓冲区宽高比不一致时补黑边。
 /// Electron 等应用的 `SCWindow.frame` 还可能与实际捕获表面短暂不一致，所以不能看到一帧变化
-/// 就立即调整窗口；连续多帧一致后才采纳，同时忽略像素取整造成的微小误差。
-struct CapturedContentAspectTracker {
+/// 就立即调整窗口；同时满足连续帧数和稳定时长后才采纳，并忽略像素取整造成的微小误差。
+struct CapturedContentGeometryTracker {
     static let requiredStableSamples = 3
-    static let correctionThreshold: CGFloat = 0.005
+    static let requiredStableDuration: TimeInterval = 0.3
     static let candidateTolerance: CGFloat = 0.002
 
-    private var candidateAspect: CGFloat?
+    private var candidateSize: CGSize?
     private var candidateSamples = 0
+    private var candidateStartedAt: TimeInterval?
 
-    /// 输入一帧的有效内容尺寸；确认需要校正时返回稳定后的新宽高比，否则返回 nil。
-    mutating func observe(contentSize: CGSize, expectedSize: CGSize) -> CGFloat? {
-        guard let observed = Self.aspect(of: contentSize),
-              let expected = Self.aspect(of: expectedSize) else {
-            resetCandidate()
+    /// 输入一帧还原出的源窗口尺寸；达到稳定条件时返回平均尺寸，否则返回 nil。
+    mutating func observe(sourceSize: CGSize, at now: TimeInterval) -> CGSize? {
+        guard Self.isValid(sourceSize), now.isFinite else {
+            reset()
             return nil
         }
 
-        if let candidateAspect,
-           Self.relativeDifference(candidateAspect, observed) <= Self.candidateTolerance {
-            let total = candidateAspect * CGFloat(candidateSamples) + observed
+        if let candidateSize,
+           Self.relativeDifference(candidateSize, sourceSize) <= Self.candidateTolerance {
+            let count = CGFloat(candidateSamples)
             candidateSamples += 1
-            self.candidateAspect = total / CGFloat(candidateSamples)
+            self.candidateSize = CGSize(
+                width: (candidateSize.width * count + sourceSize.width) / CGFloat(candidateSamples),
+                height: (candidateSize.height * count + sourceSize.height) / CGFloat(candidateSamples)
+            )
         } else {
-            candidateAspect = observed
+            candidateSize = sourceSize
             candidateSamples = 1
+            candidateStartedAt = now
         }
 
         guard candidateSamples >= Self.requiredStableSamples,
-              let stableAspect = candidateAspect else { return nil }
-        resetCandidate()
-
-        guard Self.relativeDifference(stableAspect, expected) > Self.correctionThreshold else {
-            return nil
-        }
-        return stableAspect
+              let candidateStartedAt,
+              now - candidateStartedAt >= Self.requiredStableDuration,
+              let stableSize = candidateSize else { return nil }
+        reset()
+        return stableSize
     }
 
-    /// 保持源坐标宽度不变，只按真实内容宽高比修正高度。
-    static func correctedSize(_ size: CGSize, matching aspect: CGFloat) -> CGSize? {
-        guard size.width.isFinite, size.width > 1, aspect.isFinite, aspect > 0 else { return nil }
-        let height = size.width / aspect
-        guard height.isFinite, height > 1 else { return nil }
-        return CGSize(width: size.width, height: height)
-    }
-
-    static func relativeDifference(_ lhs: CGFloat, _ rhs: CGFloat) -> CGFloat {
-        guard lhs.isFinite, rhs.isFinite, lhs > 0, rhs > 0 else { return .infinity }
-        return abs(lhs - rhs) / max(lhs, rhs)
-    }
-
-    private static func aspect(of size: CGSize) -> CGFloat? {
-        guard size.width.isFinite, size.height.isFinite,
-              size.width > 1, size.height > 1 else { return nil }
-        return size.width / size.height
-    }
-
-    private mutating func resetCandidate() {
-        candidateAspect = nil
+    mutating func reset() {
+        candidateSize = nil
         candidateSamples = 0
+        candidateStartedAt = nil
+    }
+
+    static func relativeDifference(_ lhs: CGSize, _ rhs: CGSize) -> CGFloat {
+        guard isValid(lhs), isValid(rhs) else { return .infinity }
+        let dw = abs(lhs.width - rhs.width) / max(lhs.width, rhs.width)
+        let dh = abs(lhs.height - rhs.height) / max(lhs.height, rhs.height)
+        return max(dw, dh)
+    }
+
+    private static func isValid(_ size: CGSize) -> Bool {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return false }
+        return true
+    }
+}
+
+/// 同一捕获目标的源几何权威状态。
+///
+/// 建流前只能用 SCWindow / AX 尺寸作为猜测；一旦完整帧确认了原始内容尺寸，暂停、恢复和
+/// 延迟 recheck 都必须保留帧结果。只有目标窗口实例发生重匹配时才重新允许外部尺寸采样。
+struct SourceGeometryAuthority {
+    private(set) var frameConfirmedSize: CGSize?
+
+    var acceptsWindowServerSamples: Bool { frameConfirmedSize == nil }
+
+    mutating func confirmFrameSize(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else { return }
+        frameConfirmedSize = size
+    }
+
+    mutating func resetForNewTarget() {
+        frameConfirmedSize = nil
     }
 }
 
