@@ -244,7 +244,6 @@ final class SessionStore {
                                   modifierFlags: NSEvent.ModifierFlags) -> CGRect {
         guard !modifierFlags.contains(.control),
               let screen = targetScreen(for: proposed) else { return proposed }
-        let visibleFrame = screen.visibleFrame
         let siblings = sessions.compactMap { session -> CGRect? in
             guard session !== moving, session.isVisibleForSnapping else { return nil }
             let frame = session.windowFrame
@@ -254,15 +253,16 @@ final class SessionStore {
                   isSameDisplay(siblingScreen, screen) else { return nil }
             return frame
         }
-        return Geo.snappedWindowFrame(proposed, in: visibleFrame, siblings: siblings)
+        // 屏幕边缘磁吸使用完整 frame，确保在多显示器以及菜单栏 / Dock 位于副屏时，
+        // 浮窗仍然贴到物理显示器边缘，而不是停在系统工作区边界。
+        return Geo.snappedWindowFrame(proposed, in: screen.frame, siblings: siblings)
     }
 
     /// 跨屏拖动时取与窗口重叠面积最大的屏幕，避免固定使用 `NSScreen.main`。
     private func targetScreen(for frame: CGRect) -> NSScreen? {
         let screens = NSScreen.screens
         guard let best = screens.max(by: { lhs, rhs in
-            // 屏幕归属用完整 frame 判定；visibleFrame 排除 Dock / 菜单栏，
-            // 只适合作为最终的磁吸安全边界。
+            // 屏幕归属用完整 frame 判定，避免 Dock / 菜单栏改变跨屏归属结果。
             overlapArea(lhs.frame, frame) < overlapArea(rhs.frame, frame)
         }) else { return nil }
         if overlapArea(best.frame, frame) > 0 { return best }

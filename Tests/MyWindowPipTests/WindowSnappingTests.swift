@@ -27,19 +27,33 @@ final class WindowSnappingTests: XCTestCase {
         ))
     }
 
-    func testScreenEdgeSnappingSupportsNegativeDisplayCoordinatesAndPreservesSize() {
-        let visibleFrame = CGRect(x: -1200, y: -100, width: 1200, height: 900)
-        let proposed = CGRect(x: -311, y: 200, width: 300, height: 180)
+    func testScreenEdgeSnappingHasNoGapOnNegativeDisplayCoordinates() {
+        let screenFrame = CGRect(x: -1200, y: -100, width: 1200, height: 900)
+        let cases: [(proposed: CGRect, expected: CGRect)] = [
+            (CGRect(x: -1199, y: 200, width: 300, height: 180),
+             CGRect(x: -1200, y: 200, width: 300, height: 180)),
+            (CGRect(x: -301, y: 200, width: 300, height: 180),
+             CGRect(x: -300, y: 200, width: 300, height: 180)),
+            (CGRect(x: -800, y: -99, width: 300, height: 180),
+             CGRect(x: -800, y: -100, width: 300, height: 180)),
+            (CGRect(x: -800, y: 699, width: 300, height: 100),
+             CGRect(x: -800, y: 700, width: 300, height: 100)),
+        ]
 
-        let snapped = Geo.snappedWindowFrame(proposed, in: visibleFrame, siblings: [])
+        for testCase in cases {
+            let snapped = Geo.snappedWindowFrame(
+                testCase.proposed,
+                in: screenFrame,
+                siblings: []
+            )
 
-        XCTAssertEqual(snapped.maxX, -12, accuracy: 0.001)
-        XCTAssertEqual(snapped.origin.y, proposed.origin.y, accuracy: 0.001)
-        XCTAssertEqual(snapped.size, proposed.size)
+            XCTAssertEqual(snapped, testCase.expected)
+            XCTAssertEqual(snapped.size, testCase.proposed.size)
+        }
     }
 
     func testSiblingSnappingJoinsEveryAdjacentEdgeWithNoGap() {
-        let visibleFrame = CGRect(x: 0, y: 0, width: 2000, height: 1200)
+        let screenFrame = CGRect(x: 0, y: 0, width: 2000, height: 1200)
         let sibling = CGRect(x: 900, y: 400, width: 200, height: 100)
 
         let cases: [(proposed: CGRect, expectedOrigin: CGPoint)] = [
@@ -52,7 +66,7 @@ final class WindowSnappingTests: XCTestCase {
         for testCase in cases {
             let snapped = Geo.snappedWindowFrame(
                 testCase.proposed,
-                in: visibleFrame,
+                in: screenFrame,
                 siblings: [sibling]
             )
 
@@ -63,22 +77,22 @@ final class WindowSnappingTests: XCTestCase {
     }
 
     func testScreenEdgeOutsideThresholdDoesNotSnap() {
-        let visibleFrame = CGRect(x: -1200, y: -100, width: 1200, height: 900)
+        let screenFrame = CGRect(x: -1200, y: -100, width: 1200, height: 900)
         let proposed = CGRect(x: -327, y: 200, width: 300, height: 180)
 
-        let snapped = Geo.snappedWindowFrame(proposed, in: visibleFrame, siblings: [])
+        let snapped = Geo.snappedWindowFrame(proposed, in: screenFrame, siblings: [])
 
         XCTAssertEqual(snapped, proposed)
     }
 
     func testDistantSiblingDoesNotInfluenceAlignment() {
-        let visibleFrame = CGRect(x: 0, y: 0, width: 2000, height: 1200)
+        let screenFrame = CGRect(x: 0, y: 0, width: 2000, height: 1200)
         let proposed = CGRect(x: 650, y: 650, width: 200, height: 100)
         let distantSibling = CGRect(x: 649, y: 50, width: 200, height: 100)
 
         let snapped = Geo.snappedWindowFrame(
             proposed,
-            in: visibleFrame,
+            in: screenFrame,
             siblings: [distantSibling]
         )
 
