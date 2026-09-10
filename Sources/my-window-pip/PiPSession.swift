@@ -48,8 +48,11 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     private var rendererRestartTimes: [TimeInterval] = []
     /// SCK 帧还原出的源窗口尺寸连续稳定后才采纳，避免瞬态帧让浮窗来回跳。
     private var capturedContentGeometryTracker = CapturedContentGeometryTracker()
-    /// 控制 SCWindow/AX 猜测与完整帧几何之间的权威切换。
+    /// 防止已核验的窗口几何被恢复期间的缓存尺寸覆盖。
     private var sourceGeometryAuthority = SourceGeometryAuthority()
+    /// 仅在帧尺寸与基准不同时查询真实窗口，最多每秒一次。
+    private var lastGeometryVerification: TimeInterval?
+    private var lastGeometryVerificationSummary: String?
 
     private static let hiddenAutoCloseSeconds: TimeInterval = 60
     private static let maxReconnectAttempts = 3
@@ -538,7 +541,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         }
     }
 
-    /// 用完整帧附件还原出的真实源窗口尺寸校正整窗 PiP。
+    /// 用完整帧附件触发真实窗口尺寸核验，再校正整窗 PiP。
     ///
     /// SCK 会在 `scalesToFit` 输出中保留源宽高比；源窗口尺寸变化或 Electron 捕获表面与
     /// `SCWindow.frame` 不一致时，剩余区域被填成黑色。这里只接受实际由 `sourceRect=.zero`
@@ -556,20 +559,49 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
             return
         }
         let now = ProcessInfo.processInfo.systemUptime
-        guard let stableSourceSize = capturedContentGeometryTracker.observe(
+        guard let stableFrameSize = capturedContentGeometryTracker.observe(
             sourceSize: observedSourceSize,
             at: now,
             configuration: configuration
         ) else { return }
 
-        // 从这一刻起，帧几何是本窗口实例的权威来源；暂停/恢复期间保留，重匹配时才清空。
-        sourceGeometryAuthority.confirmFrameSize(stableSourceSize)
+        let before = baseRect.size
+        let frameDiffers = abs(before.width - stableFrameSize.width) > 1
+            || abs(before.height - stableFrameSize.height) > 1
+        // 首次确认也需要核验，避免把初始捕获表面的额外边距锁定为窗口几何。
+        guard frameDiffers || sourceGeometryAuthority.acceptsWindowServerSamples else { return }
+        if let lastGeometryVerification, now - lastGeometryVerification < 1 { return }
+        lastGeometryVerification = now
+        guard let windowID = state.source.windowID else { return }
+        let windowSize = SourceWindowActivator.currentWindowServerSize(of: windowID)
+        // WindowServer 与现有基准相同便无需 AX IPC；有差异时由 AX 排除总览变换。
+        let windowUnchanged = windowSize.map {
+            abs($0.width - before.width) <= 1 && abs($0.height - before.height) <= 1
+        } ?? false
+        let axSize = windowUnchanged ? nil : SourceWindowActivator.currentSize(of: windowID)
+        guard let stableSourceSize = Geo.verifiedWindowSize(
+            current: baseRect, windowSize: windowSize, axSize: axSize
+        ) else { return }
+
+        let summary = String(
+            format: "geometry.verify frame=%.0fx%.0f window=%.0fx%.0f pip=%.0fx%.0f",
+            stableFrameSize.width, stableFrameSize.height,
+            stableSourceSize.width, stableSourceSize.height,
+            windowController.contentPointSize.width, windowController.contentPointSize.height
+        )
+        if summary != lastGeometryVerificationSummary {
+            windowController.recordRendererEvent(summary)
+            Log.geometry("windowID=\(windowID) \(summary)")
+            lastGeometryVerificationSummary = summary
+        }
+
+        // 保留已核验的基准，恢复捕获时不能被 SCWindow 的总览中间态覆盖。
+        sourceGeometryAuthority.confirmVerifiedSize(stableSourceSize)
         sourcePixelSize = CGSize(
             width: stableSourceSize.width * geometry.scaleFactor,
             height: stableSourceSize.height * geometry.scaleFactor
         )
 
-        let before = baseRect.size
         let sizeChanged = abs(before.width - stableSourceSize.width) > 1
             || abs(before.height - stableSourceSize.height) > 1
         guard sizeChanged else { return }
@@ -582,7 +614,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
 
         windowController.recordRendererEvent(
             String(
-                format: "geometry.frame-source %.0fx%.0f->%.0fx%.0f aspect=%.4f->%.4f",
+                format: "geometry.verified-window %.0fx%.0f->%.0fx%.0f aspect=%.4f->%.4f",
                 before.width, before.height,
                 stableSourceSize.width, stableSourceSize.height,
                 oldAspect, newAspect
@@ -704,6 +736,8 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
             self.state.source = rematchedSource
             self.positionIdentity = self.positionIdentity.retargetingWindow(to: rematchedSource)
             self.sourceGeometryAuthority.resetForNewTarget()
+            self.lastGeometryVerification = nil
+            self.lastGeometryVerificationSummary = nil
             self.capturedContentGeometryTracker.reset()
             // 重新匹配同样不能照抄可能被总览变换过的尺寸
             let size = self.trustedSize(of: window) ?? self.baseRect.size

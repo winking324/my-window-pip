@@ -10,6 +10,23 @@ final class CapturedContentGeometryTests: XCTestCase {
         sourceRect: .zero
     )
 
+    func testCaptureDoesNotExpandToIncludeChildWindows() throws {
+        guard #available(macOS 14.2, *) else {
+            throw XCTSkip("Child-window capture configuration requires macOS 14.2")
+        }
+        // 整窗和放大后都必须保持同一目标，不能在 retune 时重新包含附属窗口。
+        for rect in [CGRect.zero, CGRect(x: 100, y: 100, width: 960, height: 525)] {
+            let configuration = CaptureEngine.makeConfiguration(
+                sourceRect: rect, pointSize: CGSize(width: 640, height: 350),
+                scale: 2, fps: 5, showsCursor: false
+            )
+            XCTAssertFalse(configuration.includeChildWindows)
+            XCTAssertEqual(configuration.sourceRect, rect)
+            XCTAssertEqual(configuration.width, 1280)
+            XCTAssertEqual(configuration.height, 700)
+        }
+    }
+
     func testFrameGeometryRestoresOriginalSourcePointSize() {
         let info: [SCStreamFrameInfo: Any] = [
             .contentRect: CGRect(x: 0, y: 0, width: 320, height: 160).dictionaryRepresentation,
@@ -128,18 +145,18 @@ final class CapturedContentGeometryTests: XCTestCase {
         XCTAssertFalse(transition.capturesFullSource)
     }
 
-    func testFrameGeometryRemainsAuthoritativeAcrossRecovery() {
+    func testVerifiedWindowGeometryRemainsAuthoritativeAcrossRecovery() {
         var authority = SourceGeometryAuthority()
         XCTAssertTrue(authority.acceptsWindowServerSamples)
 
-        authority.confirmFrameSize(CGSize(width: 1600, height: 800))
+        authority.confirmVerifiedSize(CGSize(width: 1600, height: 800))
 
         XCTAssertFalse(authority.acceptsWindowServerSamples)
-        XCTAssertEqual(authority.frameConfirmedSize, CGSize(width: 1600, height: 800))
+        XCTAssertEqual(authority.verifiedSize, CGSize(width: 1600, height: 800))
 
         authority.resetForNewTarget()
         XCTAssertTrue(authority.acceptsWindowServerSamples)
-        XCTAssertNil(authority.frameConfirmedSize)
+        XCTAssertNil(authority.verifiedSize)
     }
 
     func testOnlyUnzoomedWholeWindowRequestsUncroppedConfiguration() {
@@ -153,5 +170,54 @@ final class CapturedContentGeometryTests: XCTestCase {
         XCTAssertTrue(whole.usesUncroppedWholeWindow(at: 1))
         XCTAssertFalse(whole.usesUncroppedWholeWindow(at: 2))
         XCTAssertFalse(region.usesUncroppedWholeWindow(at: 1))
+    }
+
+    func testConversationChangesDoNotResizeAnUnchangedWindow() throws {
+        let windowSize = CGSize(width: 1920, height: 1050)
+        var base = CGRect(origin: .zero, size: windowSize)
+        var tracker = CapturedContentGeometryTracker()
+        // 日志中的尺寸来回跳动，每个状态持续超过旧逻辑的稳定窗口。
+        for (index, width) in [1920.0, 1962, 1920, 1962, 1920].enumerated() {
+            let frameSize = CGSize(width: width, height: 1050)
+            let start = Double(index)
+            XCTAssertNil(tracker.observe(sourceSize: frameSize, at: start,
+                                         configuration: fullConfiguration))
+            XCTAssertNil(tracker.observe(sourceSize: frameSize, at: start + 0.2,
+                                         configuration: fullConfiguration))
+            XCTAssertNotNil(tracker.observe(sourceSize: frameSize, at: start + 0.4,
+                                            configuration: fullConfiguration))
+            base.size = try XCTUnwrap(Geo.verifiedWindowSize(
+                current: base, windowSize: windowSize, axSize: nil
+            ))
+            XCTAssertEqual(base.size, windowSize)
+        }
+    }
+
+    func testRealWindowResizeIsAcceptedWithoutAccessibility() {
+        let base = CGRect(x: 0, y: 0, width: 1920, height: 1050)
+        let resized = CGSize(width: 1440, height: 1050)
+        XCTAssertEqual(Geo.verifiedWindowSize(current: base, windowSize: resized, axSize: nil), resized)
+    }
+
+    func testAccessibilityAllowsRealProportionalResize() {
+        let base = CGRect(x: 0, y: 0, width: 1920, height: 1050)
+        let resized = CGSize(width: 1280, height: 700)
+        XCTAssertEqual(Geo.verifiedWindowSize(current: base, windowSize: resized, axSize: resized), resized)
+    }
+
+    func testMissionControlTransformCannotResizeThePiP() {
+        let base = CGRect(x: 0, y: 0, width: 1920, height: 1050)
+        let overview = CGSize(width: 1280, height: 700)
+        XCTAssertNil(Geo.verifiedWindowSize(current: base, windowSize: overview, axSize: nil))
+        XCTAssertEqual(Geo.verifiedWindowSize(current: base, windowSize: overview, axSize: base.size), base.size)
+    }
+
+    func testMissingOrInvalidWindowGeometryDoesNotAuthorizeResize() {
+        let base = CGRect(x: 0, y: 0, width: 1920, height: 1050)
+        for size: CGSize? in [nil, .zero, CGSize(width: CGFloat.nan, height: 1050),
+                              CGSize(width: 1920, height: CGFloat.infinity)] {
+            XCTAssertNil(Geo.verifiedWindowSize(current: base, windowSize: size, axSize: nil))
+        }
+        XCTAssertEqual(Geo.verifiedWindowSize(current: base, windowSize: nil, axSize: base.size), base.size)
     }
 }
