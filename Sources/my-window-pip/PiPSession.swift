@@ -648,9 +648,9 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         lastGeometryVerification = now
         guard let windowID = state.source.windowID else { return }
         let requestedBase = baseRect
-        let requestedPID = sourcePID
+        guard let requestedPID = sourcePID else { return }
         sourceGeometryProbe.verify(
-            windowID: windowID, current: requestedBase, stableFrameSize: stableFrameSize
+            windowID: windowID, expectedPID: requestedPID, current: requestedBase, stableFrameSize: stableFrameSize
         ) { [weak self] verified in
             guard let self, !self.isClosed, !self.state.isPaused,
                   self.state.source.windowID == windowID, self.sourcePID == requestedPID,

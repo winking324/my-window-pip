@@ -164,22 +164,16 @@ enum SourceWindowActivator {
         return exactWindow(id: windowID, in: windows) != nil
     }
 
-    /// 按确切 windowID 读取实时边界，避免 SCShareableContent 缓存和可变标题的影响。
-    static func currentWindowServerSize(of windowID: CGWindowID) -> CGSize? {
-        guard let bounds = windowInfo(of: windowID)?[kCGWindowBounds as String] as? NSDictionary,
-              let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
-        return rect.size
-    }
-
     /// 读取指定窗口的 AX 尺寸。
     ///
     /// 用途：调度中心 / Exposé 期间 `SCWindow.frame` 报的是被总览变换过的矩形，而 AX 读到的
     /// 仍是窗口自己的真实尺寸（实测总览中 SCWindow=1092×555 而 AX=1600×813），所以拿它做权威
     /// 校验。未授予辅助功能权限时返回 nil，调用方退回签名判定，不弹任何权限框。
-    static func currentSize(of windowID: CGWindowID) -> CGSize? {
+    static func currentSize(of windowID: CGWindowID, expectedPID: pid_t? = nil) -> CGSize? {
         guard Permissions.hasAccessibility,
               let number = windowInfo(of: windowID)?[kCGWindowOwnerPID as String] as? NSNumber
         else { return nil }
+        guard expectedPID == nil || expectedPID == pid_t(number.int32Value) else { return nil }
         let app = appElement(pid_t(number.int32Value))
         guard let windows = windows(of: app),
               let target = exactWindow(id: windowID, in: windows) else { return nil }
