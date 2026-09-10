@@ -59,14 +59,8 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     private var rendererRestartTimes: [TimeInterval] = []
     /// SCK 帧还原出的源窗口尺寸连续稳定后才采纳，避免瞬态帧让浮窗来回跳。
     private var capturedContentGeometryTracker = CapturedContentGeometryTracker()
-    /// 防止已核验的窗口几何被恢复期间的缓存尺寸覆盖。
+    /// 控制 SCWindow/AX 猜测与完整帧几何之间的权威切换。
     private var sourceGeometryAuthority = SourceGeometryAuthority()
-    /// 仅在帧尺寸与基准不同时查询真实窗口，最多每秒一次。
-    private var lastGeometryVerification: TimeInterval?
-    private var lastGeometryVerificationSummary: String?
-    private let sourceGeometryProbe = SourceGeometryProbe(queue: PiPSession.sourceProbeQueue)
-    private var latestGeometryConfiguration: CaptureFrameConfiguration?
-    private var latestGeometrySize: CGSize?
 
     private static let hiddenAutoCloseSeconds: TimeInterval = 60
     private static let maxReconnectAttempts = 3
@@ -95,7 +89,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         baseRect = request.baseSourceRect
         sourcePixelSize = request.sourcePixelSize
         positionIdentity = request.positionIdentity
-        sourcePID = SourceWindowActivator.resolvedOwnerPID(knownPID: nil, windowPID: request.sourcePID)
+        sourcePID = request.source.windowID.flatMap { SourceWindowActivator.ownerPID(of: $0) }
         idleDetector = IdleDetector()
 
         let prefs = Preferences.shared
@@ -133,7 +127,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     func close() {
-        sourceGeometryProbe.invalidate()
         guard !isClosed else { return }
         windowController.recordRendererEvent("session.close")
         isClosed = true
@@ -430,7 +423,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     private func retune(reason: String) {
-        sourceGeometryProbe.invalidate()
         guard engine.isRunning else { return }
         let configuration = makeConfiguration()
         windowController.recordRendererEvent(
@@ -440,7 +432,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     private func pauseCapture(reason: String) {
-        sourceGeometryProbe.invalidate()
         guard engine.isRunning, !engine.isPaused else { return }
         windowController.recordRendererEvent("capture.pause reason=\(reason)")
         engine.pause()
@@ -464,16 +455,11 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         switch state.source {
         case let .window(windowID, _, _, _):
             ShareableContentStore.shared.window(id: windowID) { [weak self] window in
-                guard let self, !self.isClosed, self.state.source.windowID == windowID else { return }
+                guard let self, !self.isClosed else { return }
                 guard let window else {
                     self.handleSourceMissing()
                     return
                 }
-                // 老调用方/早期快照可能未携带 PID；以实际用于建流的 SCWindow 补全。
-                // 已确认的 owner 必须保持不变，只有显式 rematch 才能更换。
-                self.sourcePID = SourceWindowActivator.resolvedOwnerPID(
-                    knownPID: self.sourcePID, windowPID: window.owningApplication?.processID
-                )
                 self.syncBaseRectIfNeeded(with: window)
                 self.startStream(filter: CaptureEngine.filter(for: window))
             }
@@ -492,7 +478,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     private func startStream(filter: SCContentFilter) {
-        sourceGeometryProbe.invalidate()
         capturedContentGeometryTracker.reset()
         let configuration = makeConfiguration()
         windowController.recordRendererEvent("capture.start \(configurationSummary(configuration))")
@@ -579,7 +564,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     // MARK: - CaptureEngineDelegate
 
     func captureWillRestart() {
-        sourceGeometryProbe.invalidate()
         capturedContentGeometryTracker.reset()
         windowController.recordRendererEvent("capture.restart.begin")
         windowController.prepareForCaptureDiscontinuity("捕获流即将重建")
@@ -605,8 +589,6 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
                 self.probeTimer?.invalidate()
                 self.probeTimer = nil
             }
-            self.latestGeometryConfiguration = configuration
-            self.latestGeometrySize = capturedContentGeometry?.sourcePointSize
             if let capturedContentGeometry {
                 self.reconcileCapturedContentGeometry(
                     capturedContentGeometry,
@@ -617,7 +599,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         }
     }
 
-    /// 用完整帧附件触发真实窗口尺寸核验，再校正整窗 PiP。
+    /// 用完整帧附件还原出的真实源窗口尺寸校正整窗 PiP。
     ///
     /// SCK 会在 `scalesToFit` 输出中保留源宽高比；源窗口尺寸变化或 Electron 捕获表面与
     /// `SCWindow.frame` 不一致时，剩余区域被填成黑色。这里只接受实际由 `sourceRect=.zero`
@@ -626,9 +608,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         _ geometry: FrameContentGeometry,
         configuration: CaptureFrameConfiguration
     ) {
-        guard positionIdentity.usesUncroppedWholeWindow(
-            at: state.zoom, hasSelectionCrop: selectedBaseRect != nil
-        ) else {
+        guard positionIdentity.capturesWholeWindow, selectedBaseRect == nil else {
             capturedContentGeometryTracker.reset()
             return
         }
@@ -637,62 +617,20 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
             return
         }
         let now = ProcessInfo.processInfo.systemUptime
-        guard let stableFrameSize = capturedContentGeometryTracker.observe(
+        guard let stableSourceSize = capturedContentGeometryTracker.observe(
             sourceSize: observedSourceSize,
             at: now,
             configuration: configuration
         ) else { return }
 
-        let before = baseRect.size
-        let frameDiffers = abs(before.width - stableFrameSize.width) > 1
-            || abs(before.height - stableFrameSize.height) > 1
-        // 首次确认也需要核验，避免把初始捕获表面的额外边距锁定为窗口几何。
-        guard frameDiffers || sourceGeometryAuthority.acceptsWindowServerSamples else { return }
-        guard !sourceGeometryProbe.isInFlight else { return }
-        if let lastGeometryVerification, now - lastGeometryVerification < 1 { return }
-        lastGeometryVerification = now
-        guard let windowID = state.source.windowID else { return }
-        let requestedBase = baseRect
-        guard let requestedPID = sourcePID else { return }
-        sourceGeometryProbe.verify(
-            windowID: windowID, expectedPID: requestedPID, current: requestedBase, stableFrameSize: stableFrameSize
-        ) { [weak self] verified in
-            guard let self, !self.isClosed, !self.state.isPaused,
-                  self.state.source.windowID == windowID, self.sourcePID == requestedPID,
-                  self.baseRect == requestedBase, self.selectedBaseRect == nil,
-                  self.latestGeometryConfiguration == configuration,
-                  let latestSize = self.latestGeometrySize,
-                  CapturedContentGeometryTracker.relativeDifference(latestSize, stableFrameSize)
-                    <= CapturedContentGeometryTracker.candidateTolerance,
-                  let verified else { return }
-            self.applyVerifiedGeometry(verified, frameSize: stableFrameSize,
-                                       scaleFactor: geometry.scaleFactor, windowID: windowID)
-        }
-    }
-
-    /// 仅主线程应用仍属于当前捕获配置和目标的后台核验结果。
-    private func applyVerifiedGeometry(_ stableSourceSize: CGSize, frameSize stableFrameSize: CGSize,
-                                       scaleFactor: CGFloat, windowID: CGWindowID) {
-        let before = baseRect.size
-        let summary = String(
-            format: "geometry.verify frame=%.0fx%.0f window=%.0fx%.0f pip=%.0fx%.0f",
-            stableFrameSize.width, stableFrameSize.height,
-            stableSourceSize.width, stableSourceSize.height,
-            windowController.contentPointSize.width, windowController.contentPointSize.height
-        )
-        if summary != lastGeometryVerificationSummary {
-            windowController.recordRendererEvent(summary)
-            Log.geometry("windowID=\(windowID) \(summary)")
-            lastGeometryVerificationSummary = summary
-        }
-
-        // 保留已核验的基准，恢复捕获时不能被 SCWindow 的总览中间态覆盖。
-        sourceGeometryAuthority.confirmVerifiedSize(stableSourceSize)
+        // 从这一刻起，帧几何是本窗口实例的权威来源；暂停/恢复期间保留，重匹配时才清空。
+        sourceGeometryAuthority.confirmFrameSize(stableSourceSize)
         sourcePixelSize = CGSize(
-            width: stableSourceSize.width * scaleFactor,
-            height: stableSourceSize.height * scaleFactor
+            width: stableSourceSize.width * geometry.scaleFactor,
+            height: stableSourceSize.height * geometry.scaleFactor
         )
 
+        let before = baseRect.size
         let sizeChanged = abs(before.width - stableSourceSize.width) > 1
             || abs(before.height - stableSourceSize.height) > 1
         guard sizeChanged else { return }
@@ -705,7 +643,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
 
         windowController.recordRendererEvent(
             String(
-                format: "geometry.verified-window %.0fx%.0f->%.0fx%.0f aspect=%.4f->%.4f",
+                format: "geometry.frame-source %.0fx%.0f->%.0fx%.0f aspect=%.4f->%.4f",
                 before.width, before.height,
                 stableSourceSize.width, stableSourceSize.height,
                 oldAspect, newAspect
@@ -886,14 +824,11 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
     }
 
     private func adoptRematchedWindow(_ window: SCWindow, reason: String) {
-        sourceGeometryProbe.invalidate()
         state.source = ShareableContentStore.shared.captureSource(for: window)
         // 位置记忆只替换窗口实例身份，区域几何保持不变，重启源应用后仍能落回原处。
         positionIdentity = positionIdentity.retargetingWindow(to: state.source)
         sourcePID = window.owningApplication?.processID
         sourceGeometryAuthority.resetForNewTarget()
-        lastGeometryVerification = nil
-        lastGeometryVerificationSummary = nil
         capturedContentGeometryTracker.reset()
         offscreenRetargetAttempted = false
         // 重匹配同样不能照抄可能被总览变换过的尺寸。若用户已框选区域，按旧基准的归一化位置

@@ -56,13 +56,6 @@ enum SourceWindowActivator {
         return pid_t(number.int32Value)
     }
 
-    /// 用选中/建流窗口的元数据补全 owner；不能用后续快照覆盖已确认的身份。
-    static func resolvedOwnerPID(knownPID: pid_t?, windowPID: pid_t?) -> pid_t? {
-        if let knownPID, knownPID > 0 { return knownPID }
-        guard let windowPID, windowPID > 0 else { return nil }
-        return windowPID
-    }
-
     /// 生命周期探测：直接查 WindowServer + 进程身份，AX 只负责确认 minimized。
     /// 调用方应放在低频 utility queue；本函数不会触发权限弹窗。
     static func lifecycleObservation(
@@ -176,11 +169,10 @@ enum SourceWindowActivator {
     /// 用途：调度中心 / Exposé 期间 `SCWindow.frame` 报的是被总览变换过的矩形，而 AX 读到的
     /// 仍是窗口自己的真实尺寸（实测总览中 SCWindow=1092×555 而 AX=1600×813），所以拿它做权威
     /// 校验。未授予辅助功能权限时返回 nil，调用方退回签名判定，不弹任何权限框。
-    static func currentSize(of windowID: CGWindowID, expectedPID: pid_t? = nil) -> CGSize? {
+    static func currentSize(of windowID: CGWindowID) -> CGSize? {
         guard Permissions.hasAccessibility,
               let number = windowInfo(of: windowID)?[kCGWindowOwnerPID as String] as? NSNumber
         else { return nil }
-        guard expectedPID == nil || expectedPID == pid_t(number.int32Value) else { return nil }
         let app = appElement(pid_t(number.int32Value))
         guard let windows = windows(of: app),
               let target = exactWindow(id: windowID, in: windows) else { return nil }

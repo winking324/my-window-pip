@@ -2,7 +2,7 @@ import Foundation
 
 /// 轻量分级日志。用 `--debug` 构建（-D DEBUG）时才输出 debug 级别。
 ///
-/// warn / error 和不含内容的尺寸核验记录会写入本地滚动日志，
+/// 只有 warn / error 会写入本地滚动日志——事故现场快照本身就是 `Log.warn`，排障能力不减，
 /// 而 info 级里带着窗口标题（「新建窗口 PiP：<标题>」），正常使用不应该把它留在磁盘上。
 /// 日志永不上传。
 enum Log {
@@ -76,7 +76,4 @@ enum Log {
     static func info(_ items: Any...) { emit("I", items, persist: false) }
     static func warn(_ items: Any...) { emit("W", items, persist: true) }
     static func error(_ items: Any...) { emit("E", items, persist: true) }
-
-    /// 调用方只传尺寸和窗口 ID，不含标题、会话文字或图像；几何变化时才写入。
-    static func geometry(_ message: String) { emit("G", [message], persist: true) }
 }

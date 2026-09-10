@@ -77,21 +77,21 @@ struct CapturedContentGeometryTracker {
 
 /// 同一捕获目标的源几何权威状态。
 ///
-/// 建流前用 SCWindow / AX 初始化；完整帧触发实时窗口边界核验后，暂停、恢复和
-/// 延迟 recheck 都保留已核验结果。重匹配到新窗口时才重新允许缓存尺寸初始化。
+/// 建流前只能用 SCWindow / AX 尺寸作为猜测；一旦完整帧确认了原始内容尺寸，暂停、恢复和
+/// 延迟 recheck 都必须保留帧结果。只有目标窗口实例发生重匹配时才重新允许外部尺寸采样。
 struct SourceGeometryAuthority {
-    private(set) var verifiedSize: CGSize?
+    private(set) var frameConfirmedSize: CGSize?
 
-    var acceptsWindowServerSamples: Bool { verifiedSize == nil }
+    var acceptsWindowServerSamples: Bool { frameConfirmedSize == nil }
 
-    mutating func confirmVerifiedSize(_ size: CGSize) {
+    mutating func confirmFrameSize(_ size: CGSize) {
         guard size.width.isFinite, size.height.isFinite,
               size.width > 1, size.height > 1 else { return }
-        verifiedSize = size
+        frameConfirmedSize = size
     }
 
     mutating func resetForNewTarget() {
-        verifiedSize = nil
+        frameConfirmedSize = nil
     }
 }
 
@@ -102,27 +102,6 @@ struct SourceGeometryAuthority {
 /// - **SCK 坐标**：左上原点，相对于所属 display 的左上角，单位为逻辑点（SCStreamConfiguration.sourceRect）
 /// - **源归一化坐标**：左上原点，0…1，用于 zoom anchor
 enum Geo {
-
-    /// 捕获表面（包括附属内容）变大，不代表主窗口变大。
-    /// 帧只用于触发核验；浮窗比例和裁剪基准使用实际窗口尺寸。
-    /// 无法核验时保留现状，不能重新把内容尺寸当成窗口边界。
-    static func verifiedWindowSize(current: CGRect, windowSize: CGSize?, axSize: CGSize?,
-                                   stableFrameSize: CGSize? = nil) -> CGSize? {
-        func valid(_ size: CGSize) -> Bool {
-            size.width.isFinite && size.height.isFinite && size.width > 1 && size.height > 1
-        }
-        if let axSize, valid(axSize) { return axSize }
-        guard let windowSize, valid(windowSize) else { return nil }
-        if let trusted = trustedSourceSize(sampled: windowSize, current: current, axSize: nil) {
-            return trusted
-        }
-        // 无 AX 时，WindowServer 的等比缩小也可能是真实 resize。只有已经稳定的完整
-        // 捕获帧同时确认新尺寸才采纳；总览只缩小窗口边界、帧仍为原尺寸时继续拒绝。
-        guard let stableFrameSize, valid(stableFrameSize),
-              CapturedContentGeometryTracker.relativeDifference(stableFrameSize, windowSize)
-                <= CapturedContentGeometryTracker.candidateTolerance else { return nil }
-        return windowSize
-    }
 
     // MARK: - 尺寸
 

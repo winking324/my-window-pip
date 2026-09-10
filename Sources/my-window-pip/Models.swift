@@ -200,8 +200,6 @@ struct PiPSessionState {
 struct SessionRequest {
     var source: CaptureSource
     var positionIdentity: PositionMemoryIdentity
-    /// 与选中的 SCWindow 同一份快照中的 owner，避免创建时再次查询 WindowServer 失败。
-    var sourcePID: pid_t? = nil
     /// 捕获基准矩形（源坐标系、左上原点、逻辑点）：
     /// - 整窗 PiP：`(0, 0, 窗口宽, 窗口高)`
     /// - 窗口内的区域捕获：该区域在窗口内的局部矩形
