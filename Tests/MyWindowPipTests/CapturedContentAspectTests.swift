@@ -17,7 +17,7 @@ final class CapturedContentGeometryTests: XCTestCase {
             .contentScale: CGFloat(0.2),
         ]
 
-        let geometry = FrameGate.contentGeometry(from: info)
+        let geometry = FrameGate.sourceContentGeometry(from: info)
 
         XCTAssertEqual(geometry?.surfacePixelSize, CGSize(width: 640, height: 320))
         XCTAssertEqual(geometry?.sourcePointSize, CGSize(width: 1600, height: 800))
@@ -29,7 +29,7 @@ final class CapturedContentGeometryTests: XCTestCase {
             .scaleFactor: CGFloat(2),
         ]
 
-        let geometry = FrameGate.contentGeometry(from: info)
+        let geometry = FrameGate.sourceContentGeometry(from: info)
 
         XCTAssertEqual(geometry?.surfacePixelSize, CGSize(width: 640, height: 320))
         XCTAssertNil(geometry?.sourcePointSize)
@@ -151,6 +151,7 @@ final class CapturedContentGeometryTests: XCTestCase {
         )
 
         XCTAssertTrue(whole.usesUncroppedWholeWindow(at: 1))
+        XCTAssertFalse(whole.usesUncroppedWholeWindow(at: 1, hasSelectionCrop: true))
         XCTAssertFalse(whole.usesUncroppedWholeWindow(at: 2))
         XCTAssertFalse(region.usesUncroppedWholeWindow(at: 1))
     }

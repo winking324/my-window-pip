@@ -60,20 +60,36 @@ final class SessionStore {
 
     /// 画中画指定窗口（菜单栏选窗路径）
     func pip(window: SCWindow) {
+        pip(window: window, checkCompatibility: true, checkSoftLimit: true)
+    }
+
+    private func pip(window: SCWindow, checkCompatibility: Bool, checkSoftLimit: Bool) {
         guard Permissions.ensureScreenRecording() else { return }
 
-        // 去重：同一个窗口已经有浮窗了，就把它提到最前并高亮提示
-        if let existing = session(windowID: window.windowID) {
+        let store = ShareableContentStore.shared
+        let source = store.captureSource(for: window)
+
+        // 去重：同一个窗口已经有浮窗了，就把它提到最前并高亮提示。
+        // WindowServer 可能把已销毁窗口的 ID 分配给别的应用，此时旧会话正在等待重连，
+        // 直接按 ID 去重会把新窗口错认成它；再比一次所属应用即可排除。
+        if let existing = session(windowID: window.windowID),
+           existing.positionFallbackPreferenceKey == source.preferenceKey {
             existing.bringToFront()
             existing.flashHighlight()
             return
         }
-        guard confirmIfOverLimit() else { return }
+        if checkSoftLimit, !confirmIfOverLimit() { return }
+        if checkCompatibility, handleCompatibilityIfNeeded(for: window) { return }
 
+        _ = createWindowSession(window)
+    }
+
+    @discardableResult
+    private func createWindowSession(_ window: SCWindow) -> PiPSession? {
         let store = ShareableContentStore.shared
         let source = store.captureSource(for: window)
         let size = window.frame.size
-        guard size.width > 1, size.height > 1 else { return }
+        guard size.width > 1, size.height > 1 else { return nil }
         let positionIdentity = PositionMemoryIdentity.window(
             appPreferenceKey: source.preferenceKey, windowID: window.windowID
         )
@@ -88,15 +104,106 @@ final class SessionStore {
             autoHide: Preferences.shared.autoHideDefault,
             idleDetection: Preferences.shared.idleDetectionDefault
         )
-        add(PiPSession(
+        let session = PiPSession(
             request: request,
             initialOrigin: initialOrigin(for: positionIdentity),
             cascadeIndex: sessions.count
-        ))
-        Log.info("""
-            新建窗口 PiP：\(source.displayTitle) @ \(request.fps.label) \
-            [windowID=\(window.windowID), isOnScreen=\(window.isOnScreen), isActive=\(window.isActive)]
-            """)
+        )
+        add(session)
+        Log.info("新建窗口 PiP：\(source.displayTitle) @ \(request.fps.label)")
+        return session
+    }
+
+    /// 对已验证会在 inactive Space 停止 repaint 的 Chromium / Electron 源应用提供兼容重启。
+    /// 返回 true 表示本次创建已被重启流程或用户取消接管；false 表示继续正常创建 PiP。
+    private func handleCompatibilityIfNeeded(for window: SCWindow) -> Bool {
+        guard let owner = window.owningApplication,
+              let application = NSRunningApplication(processIdentifier: owner.processID),
+              let profile = SourceAppCompatibility.profile(for: application),
+              !SourceAppCompatibility.isKnownCompatibilityLaunch(
+                  profile, pid: application.processIdentifier
+              ) else { return false }
+
+        switch SourceAppCompatibility.relaunchDecision(
+            mode: Preferences.shared.chromiumCompatibilityMode,
+            isVerified: profile.isVerified
+        ) {
+        case .skip:
+            return false
+        case .relaunch:
+            startCompatibilityRelaunch(application: application, profile: profile)
+            return true
+        case .ask:
+            break
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L.t(
+            "\(profile.appName) 可能需要 Chromium 兼容模式",
+            "\(profile.appName) may need Chromium compatibility mode"
+        )
+        alert.informativeText = profile.isVerified
+            ? L.t(
+                "MyWindowPip 已实际验证：以 Chromium 兼容模式重新启动 \(profile.appName) 后，可以继续捕获其他 Space 中的实时更新。重启会关闭当前 \(profile.appName) 进程和该应用已有的 PiP；重启完成后不会自动重新创建 PiP，请先确认没有未保存的工作。",
+                "MyWindowPip has verified that relaunching \(profile.appName) in Chromium compatibility mode keeps live updates capturable on other Spaces. Relaunching will quit the current \(profile.appName) process and close its existing PiP windows; PiP will not be recreated automatically. Save any unfinished work first."
+            )
+            : L.t(
+                "检测到 \(profile.appName) 使用 Chromium / Electron runtime。兼容模式会用已知的 Chromium 后台绘制开关重新启动它，以避免其他 Space 中停止刷新。重启会关闭当前进程及该应用已有的 PiP，完成后不会自动重新创建，请先确认没有未保存的工作。",
+                "\(profile.appName) appears to use a Chromium / Electron runtime. Compatibility mode relaunches it with the known Chromium background-rendering switch so it can keep repainting on other Spaces. Existing PiP windows for the app are closed and are not recreated automatically. Save any unfinished work first."
+            )
+        alert.addButton(withTitle: L.t("以 Chromium 兼容模式重启", "Relaunch in Chromium Compatibility Mode"))
+        alert.addButton(withTitle: L.t("直接创建 PiP", "Create PiP Anyway"))
+        alert.addButton(withTitle: L.t("取消", "Cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            startCompatibilityRelaunch(application: application, profile: profile)
+            return true
+        case .alertSecondButtonReturn:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func startCompatibilityRelaunch(
+        application: NSRunningApplication,
+        profile: SourceAppCompatibility.Profile
+    ) {
+        // 源应用重启会让旧 windowID 全部失效；与其在源应用恢复时自动把 PiP 接回并挡住
+        // 新窗口左上角，不如在重启前主动关闭该应用的窗口 PiP。重启成功后由用户按需重新创建。
+        closeWindowSessions(bundleID: profile.bundleID)
+        // 记录到 debug 级别：info 会进常驻日志，没必要长期留存用户在跑哪些应用。
+        Log.debug("以 Chromium 兼容模式重启源应用；已关闭现有 PiP：\(profile.appName)")
+
+        SourceAppCompatibility.restart(application: application, profile: profile) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case let .success(relaunched):
+                self.notify(
+                    title: L.t("Chromium 兼容模式已启用", "Chromium compatibility mode is active"),
+                    message: L.t(
+                        "\(profile.appName) 已重新启动（PID \(relaunched.processIdentifier)）。需要时请重新创建 PiP。",
+                        "\(profile.appName) relaunched (PID \(relaunched.processIdentifier)). Create a new PiP when you need it."
+                    )
+                )
+            case let .failure(error):
+                self.notify(
+                    title: L.t("Chromium 兼容模式重启失败", "Chromium compatibility relaunch failed"),
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func closeWindowSessions(bundleID: String) {
+        let matching = sessions.filter { session in
+            guard case let .window(_, sessionBundleID, _, _) = session.state.source else { return false }
+            return sessionBundleID == bundleID
+        }
+        matching.forEach { $0.close() }
     }
 
     /// 区域捕获（热键 / 菜单入口）
@@ -259,32 +366,15 @@ final class SessionStore {
     }
 
     /// 跨屏拖动时取与窗口重叠面积最大的屏幕，避免固定使用 `NSScreen.main`。
+    /// 屏幕归属用完整 frame 判定；`visibleFrame` 排除 Dock / 菜单栏，
+    /// 只适合作为最终的磁吸安全边界。
     private func targetScreen(for frame: CGRect) -> NSScreen? {
         let screens = NSScreen.screens
-        guard let best = screens.max(by: { lhs, rhs in
-            // 屏幕归属用完整 frame 判定；visibleFrame 排除 Dock / 菜单栏，
-            // 只适合作为最终的磁吸安全边界。
-            overlapArea(lhs.frame, frame) < overlapArea(rhs.frame, frame)
-        }) else { return nil }
-        if overlapArea(best.frame, frame) > 0 { return best }
-
-        // 极快拖动可能让 proposed frame 短暂落在显示器之间的空洞；
-        // 此时选距窗口中心最近的屏幕，不依赖数组顺序的平局结果。
-        let center = CGPoint(x: frame.midX, y: frame.midY)
-        return screens.min {
-            squaredDistance(from: center, to: $0.frame) < squaredDistance(from: center, to: $1.frame)
-        }
-    }
-
-    private func overlapArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        let intersection = lhs.intersection(rhs)
-        return intersection.isNull ? 0 : intersection.width * intersection.height
-    }
-
-    private func squaredDistance(from point: CGPoint, to rect: CGRect) -> CGFloat {
-        let dx = max(max(rect.minX - point.x, 0), point.x - rect.maxX)
-        let dy = max(max(rect.minY - point.y, 0), point.y - rect.maxY)
-        return dx * dx + dy * dy
+        guard let index = Geo.indexOfScreen(
+            containing: frame,
+            screenFrames: screens.map(\.frame)
+        ) else { return nil }
+        return screens[index]
     }
 
     private func isSameDisplay(_ lhs: NSScreen, _ rhs: NSScreen) -> Bool {
