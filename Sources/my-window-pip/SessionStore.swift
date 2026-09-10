@@ -97,6 +97,7 @@ final class SessionStore {
         let request = SessionRequest(
             source: source,
             positionIdentity: positionIdentity,
+            sourcePID: window.owningApplication?.processID,
             baseSourceRect: CGRect(origin: .zero, size: size),
             sourcePixelSize: store.pixelSize(of: window),
             sourcePointSize: size,
@@ -238,6 +239,7 @@ final class SessionStore {
                 let request = SessionRequest(
                     source: source,
                     positionIdentity: positionIdentity,
+                    sourcePID: window.owningApplication?.processID,
                     baseSourceRect: local,
                     sourcePixelSize: CGSize(width: local.width * scale, height: local.height * scale),
                     sourcePointSize: local.size,

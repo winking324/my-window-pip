@@ -95,7 +95,7 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         baseRect = request.baseSourceRect
         sourcePixelSize = request.sourcePixelSize
         positionIdentity = request.positionIdentity
-        sourcePID = request.source.windowID.flatMap { SourceWindowActivator.ownerPID(of: $0) }
+        sourcePID = SourceWindowActivator.resolvedOwnerPID(knownPID: nil, windowPID: request.sourcePID)
         idleDetector = IdleDetector()
 
         let prefs = Preferences.shared
@@ -464,11 +464,16 @@ final class PiPSession: NSObject, CaptureEngineDelegate, PiPWindowDelegate {
         switch state.source {
         case let .window(windowID, _, _, _):
             ShareableContentStore.shared.window(id: windowID) { [weak self] window in
-                guard let self, !self.isClosed else { return }
+                guard let self, !self.isClosed, self.state.source.windowID == windowID else { return }
                 guard let window else {
                     self.handleSourceMissing()
                     return
                 }
+                // 老调用方/早期快照可能未携带 PID；以实际用于建流的 SCWindow 补全。
+                // 已确认的 owner 必须保持不变，只有显式 rematch 才能更换。
+                self.sourcePID = SourceWindowActivator.resolvedOwnerPID(
+                    knownPID: self.sourcePID, windowPID: window.owningApplication?.processID
+                )
                 self.syncBaseRectIfNeeded(with: window)
                 self.startStream(filter: CaptureEngine.filter(for: window))
             }

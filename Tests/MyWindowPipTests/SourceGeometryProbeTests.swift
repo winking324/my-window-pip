@@ -3,6 +3,46 @@ import XCTest
 @testable import my_window_pip
 
 final class SourceGeometryProbeTests: XCTestCase {
+    func testMissingInitialOwnerCanRecoverAndVerifyAResize() throws {
+        var pid = SourceWindowActivator.resolvedOwnerPID(knownPID: nil, windowPID: nil)
+        XCTAssertNil(pid)
+        XCTAssertNil(SourceWindowActivator.resolvedOwnerPID(knownPID: pid, windowPID: 0))
+        // 创建阶段没有 PID，实际建流的 SCWindow 元数据恢复后可继续核验真实 resize。
+        pid = SourceWindowActivator.resolvedOwnerPID(knownPID: pid, windowPID: 42)
+        let owner = try XCTUnwrap(pid)
+        let size = CGSize(width: 1280, height: 720)
+        let finished = expectation(description: "recovered owner allows resize")
+        let probe = SourceGeometryProbe(queue: DispatchQueue(label: "owner-recovery-test"),
+            readWindow: { _ in .init(ownerPID: 42, size: size) }, readAX: { _, _ in nil })
+        probe.verify(windowID: 1, expectedPID: owner,
+                     current: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                     stableFrameSize: size) { verified in
+            XCTAssertEqual(verified, size)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 2)
+    }
+
+    func testLaterWindowMetadataCannotReplaceConfirmedOwner() throws {
+        let original = SourceWindowActivator.resolvedOwnerPID(knownPID: nil, windowPID: 42)
+        let pinned = try XCTUnwrap(SourceWindowActivator.resolvedOwnerPID(knownPID: original, windowPID: 99))
+        XCTAssertEqual(pinned, 42)
+        let finished = expectation(description: "replacement remains rejected")
+        let size = CGSize(width: 1280, height: 720)
+        let probe = SourceGeometryProbe(queue: DispatchQueue(label: "owner-recovery-test"),
+            readWindow: { _ in .init(ownerPID: 99, size: size) }, readAX: { _, _ in
+                XCTFail("Recovery must not query a replacement process")
+                return size
+            })
+        probe.verify(windowID: 1, expectedPID: pinned,
+                     current: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                     stableFrameSize: size) { verified in
+            XCTAssertNil(verified)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 2)
+    }
+
     func testSlowSystemQueryDoesNotBlockMainQueueAndOnlyOneRequestRuns() {
         let finished = expectation(description: "result applied on main")
         let mainResponsive = expectation(description: "main queue runs while query waits")

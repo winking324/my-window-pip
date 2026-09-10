@@ -56,6 +56,13 @@ enum SourceWindowActivator {
         return pid_t(number.int32Value)
     }
 
+    /// 用选中/建流窗口的元数据补全 owner；不能用后续快照覆盖已确认的身份。
+    static func resolvedOwnerPID(knownPID: pid_t?, windowPID: pid_t?) -> pid_t? {
+        if let knownPID, knownPID > 0 { return knownPID }
+        guard let windowPID, windowPID > 0 else { return nil }
+        return windowPID
+    }
+
     /// 生命周期探测：直接查 WindowServer + 进程身份，AX 只负责确认 minimized。
     /// 调用方应放在低频 utility queue；本函数不会触发权限弹窗。
     static func lifecycleObservation(
