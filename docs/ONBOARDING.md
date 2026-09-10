@@ -33,7 +33,7 @@ App 层    main.swift · AppDelegate · StatusBarController · SettingsWindowCon
 - **捕获健康与渲染健康分开监控**：`CaptureEngine` 的 watchdog 只判断 SCK 是否持续产帧；`RendererStallMonitor` 判断 renderer 是否持续接收帧。短暂 not-ready 正常丢帧，连续 2 秒则按 `flush → 重建 display layer → 重启捕获流` 分级恢复。macOS 14+ 只通过 `AVSampleBufferDisplayLayer.sampleBufferRenderer` 查询状态、enqueue 和 flush，不要混用 display layer 上已废弃的旧队列 API。
 - **流不连续必须重置 renderer 时间线**：pause/resume、restart、源窗口重匹配、输出像素尺寸变化或 PTS 回退时，先 flush 旧队列并保留最后画面；普通平移/缩放且输出格式不变时不要无条件 flush，以免闪烁。
 - **renderer 诊断只在事故时落盘**：每个会话用 `RendererDiagnostics` 在内存保留最近 64 条生命周期事件；确认卡流后生成 `R-XXXXXXXX` 编号并把现场快照写入 `~/Library/Logs/MyWindowPip/MyWindowPip.log`。普通 retune/帧状态不要逐条写 Release 日志；日志最多 2 MB + 一个 previous 文件，不得记录画面像素或上传。
-- **只有 warn / error 落盘**：`Log.info` 里带着窗口标题（「新建窗口 PiP：<标题>」），正常使用不该把它留在磁盘上，所以 info / debug 只进控制台。事故快照本身是 `Log.warn`，排障能力不减。落盘走专用串行队列 `com.ljzxzxl.mywindowpip.log`——帧回调也会打日志，磁盘 I/O 不能占着锁卡住捕获队列或主线程。
+- **warn / error 与尺寸核验记录落盘**：`Log.info` 里带着窗口标题（「新建窗口 PiP：<标题>」），正常使用不该把它留在磁盘上，所以 info / debug 只进控制台。尺寸核验只在变化时记录窗口 ID 与尺寸，不含标题或会话内容。事故快照本身是 `Log.warn`，排障能力不减。落盘走专用串行队列 `com.ljzxzxl.mywindowpip.log`——帧回调也会打日志，磁盘 I/O 不能占着锁卡住捕获队列或主线程。
 - **自愈重启必须有上限**：`renderer 自愈耗尽 → restartCapture → captureWillRestart → prepareForCaptureDiscontinuity → stallMonitor.reset()` 是一条能自我循环的链，renderer 永久损坏时会无限重建 SCStream。`PiPSession` 用「90 秒内最多 2 次」限流，超限只打 `Log.error` 并提示用户关闭重开；恢复成功时经 `pipRendererDidRecover()` 清零。
 - **防镜中镜**：浮窗 `sharingType = .none`；窗口枚举过滤自身 App；区域捕获的显示器过滤器按 App 排除自己。
 - **零权限优先**：任何功能都必须能在「只有屏幕录制权限」的前提下通过控制条或右键菜单完成；辅助功能权限只允许作为增强项。
