@@ -206,6 +206,35 @@ final class CapturedContentGeometryTests: XCTestCase {
         XCTAssertEqual(Geo.verifiedWindowSize(current: base, windowSize: resized, axSize: resized), resized)
     }
 
+    func testStableProportionalShrinkWithoutAccessibilityUpdatesZoomCoordinates() throws {
+        let old = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let resized = CGSize(width: 1280, height: 720)
+        var tracker = CapturedContentGeometryTracker()
+        XCTAssertNil(tracker.observe(sourceSize: resized, at: 0, configuration: fullConfiguration))
+        XCTAssertNil(tracker.observe(sourceSize: resized, at: 0.2, configuration: fullConfiguration))
+        let stable = try XCTUnwrap(tracker.observe(sourceSize: resized, at: 0.4,
+                                                  configuration: fullConfiguration))
+        let verified = try XCTUnwrap(Geo.verifiedWindowSize(
+            current: old, windowSize: resized, axSize: nil, stableFrameSize: stable
+        ))
+        XCTAssertEqual(verified, resized)
+        let crop = Geo.sourceRect(zoom: 2, anchor: CGPoint(x: 1, y: 1),
+                                  full: CGRect(origin: .zero, size: verified))
+        XCTAssertEqual(crop, CGRect(x: 640, y: 360, width: 640, height: 360))
+    }
+
+    func testProportionalOverviewBoundsStillRequireMatchingFullFrame() {
+        let base = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let overview = CGSize(width: 1280, height: 720)
+        XCTAssertNil(Geo.verifiedWindowSize(
+            current: base, windowSize: overview, axSize: nil, stableFrameSize: base.size
+        ))
+        // 有 AX 时优先采用实际窗口尺寸，即使其它两份采样都缩小了。
+        XCTAssertEqual(Geo.verifiedWindowSize(
+            current: base, windowSize: overview, axSize: base.size, stableFrameSize: overview
+        ), base.size)
+    }
+
     func testMissionControlTransformCannotResizeThePiP() {
         let base = CGRect(x: 0, y: 0, width: 1920, height: 1050)
         let overview = CGSize(width: 1280, height: 700)

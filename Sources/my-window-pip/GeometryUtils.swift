@@ -106,13 +106,22 @@ enum Geo {
     /// 捕获表面（包括附属内容）变大，不代表主窗口变大。
     /// 帧只用于触发核验；浮窗比例和裁剪基准使用实际窗口尺寸。
     /// 无法核验时保留现状，不能重新把内容尺寸当成窗口边界。
-    static func verifiedWindowSize(current: CGRect, windowSize: CGSize?, axSize: CGSize?) -> CGSize? {
+    static func verifiedWindowSize(current: CGRect, windowSize: CGSize?, axSize: CGSize?,
+                                   stableFrameSize: CGSize? = nil) -> CGSize? {
         func valid(_ size: CGSize) -> Bool {
             size.width.isFinite && size.height.isFinite && size.width > 1 && size.height > 1
         }
         if let axSize, valid(axSize) { return axSize }
         guard let windowSize, valid(windowSize) else { return nil }
-        return trustedSourceSize(sampled: windowSize, current: current, axSize: nil)
+        if let trusted = trustedSourceSize(sampled: windowSize, current: current, axSize: nil) {
+            return trusted
+        }
+        // 无 AX 时，WindowServer 的等比缩小也可能是真实 resize。只有已经稳定的完整
+        // 捕获帧同时确认新尺寸才采纳；总览只缩小窗口边界、帧仍为原尺寸时继续拒绝。
+        guard let stableFrameSize, valid(stableFrameSize),
+              CapturedContentGeometryTracker.relativeDifference(stableFrameSize, windowSize)
+                <= CapturedContentGeometryTracker.candidateTolerance else { return nil }
+        return windowSize
     }
 
     // MARK: - 尺寸
